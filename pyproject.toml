@@ -6,9 +6,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi[standard]>=0.128.0",
+    "faster-whisper>=1.2.1",
     "groq>=1.0.0",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.1",
+    "pywhispercpp>=1.4.1",
+    "requests>=2.32.5",
 ]
 
 [dependency-groups]
