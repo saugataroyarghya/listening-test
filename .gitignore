@@ -136,3 +136,6 @@ Thumbs.db
 # FastAPI specific
 *.db
 *.sqlite
+
+# Claude Code
+CLAUDE.md
