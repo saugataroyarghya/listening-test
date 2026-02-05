@@ -56,15 +56,22 @@ async def analyze_speech(
     try:
         # 1. Transcribe with Whisper
         result = await transcription_service.transcribe_from_url(url)
+        words_data = result["words"]
 
-        # 2. Get IELTS analysis from Groq
+        # 2. Calculate speaking metrics from timestamps
+        speaking_metrics = transcription_service.calculate_speaking_metrics(words_data)
+
+        # 3. Calculate pronunciation clarity from Whisper confidence scores
+        pronunciation_clarity = transcription_service.calculate_pronunciation_clarity(words_data)
+
+        # 4. Get IELTS analysis from Groq (now includes fluency analysis)
         llm_analysis = groq_service.get_ielts_analysis(
             transcript=result["text"],
-            annotated=result["annotated"]
+            annotated=result["annotated"],
+            speaking_metrics=speaking_metrics
         )
 
-        # 3. Calculate confidence metrics from words
-        words_data = result["words"]
+        # 5. Calculate confidence metrics from words
         confidences = [w["confidence"] for w in words_data]
         avg_confidence = round(sum(confidences) / len(confidences), 2) if confidences else 0
         low_confidence_words = [
@@ -72,33 +79,43 @@ async def analyze_speech(
             for w in words_data if w["confidence"] < 0.7
         ]
 
-        # 4. Build the full IELTS response structure
+        # 6. Extract LLM fluency analysis with fallbacks
+        llm_fluency = llm_analysis.get("fluency_and_coherence", {})
+
+        # Get cohesive devices from LLM
+        cohesive_devices_data = llm_fluency.get("cohesive_devices", {
+            "score": 0,
+            "feedback": "Analysis failed",
+            "devices_used": []
+        })
+
+        # 7. Calculate overall scores
+        fluency_score = llm_analysis.get("overall_fluency_coherence_score", 0)
+        lexical_score = llm_analysis.get("overall_lexical_score", 0)
+        grammar_score = llm_analysis.get("overall_grammar_score", 0)
+        pronunciation_score = pronunciation_clarity["clarity"]["score"]
+
+        # Calculate band score (now includes pronunciation clarity!)
+        available_scores = [s for s in [fluency_score, lexical_score, grammar_score, pronunciation_score] if s > 0]
+        band_score = round(sum(available_scores) / len(available_scores), 1) if available_scores else 0
+
+        # 7. Build the full IELTS response structure
         response = {
             "transcript": result["text"],
             "words": words_data,
             "analysis": {
                 "fluency_and_coherence": {
-                    "fluency": {
+                    "fluency": llm_fluency.get("fluency", {
                         "score": 0,
-                        "feedback": "In Development"
-                    },
-                    "topic_development": {
+                        "feedback": "Analysis failed"
+                    }),
+                    "topic_development": llm_fluency.get("topic_development", {
                         "score": 0,
-                        "feedback": "In Development"
-                    },
-                    "cohesive_devices": {
-                        "score": 0,
-                        "feedback": "In Development"
-                    },
-                    "pauses": {
-                        "good_pauses": 0,
-                        "bad_pauses": 0,
-                        "feedback": "In Development"
-                    },
-                    "speaking_speed": {
-                        "words_per_minute": 0,
-                        "assessment": "In Development"
-                    }
+                        "feedback": "Analysis failed"
+                    }),
+                    "cohesive_devices": cohesive_devices_data,
+                    "pauses": speaking_metrics["pauses"],
+                    "speaking_speed": speaking_metrics["speaking_speed"]
                 },
                 "lexical_resource": llm_analysis.get("lexical_resource", {
                     "vocabulary_range": {"score": 0, "feedback": "Analysis failed"},
@@ -114,29 +131,27 @@ async def analyze_speech(
                     "errors": []
                 }),
                 "pronunciation": {
-                    "clarity": {
-                        "score": 0,
-                        "feedback": "In Development"
-                    },
+                    "clarity": pronunciation_clarity["clarity"],
+                    "word_counts": pronunciation_clarity["word_counts"],
+                    "unclear_words": pronunciation_clarity["unclear_words"],
                     "intonation_and_stress": {
                         "score": 0,
-                        "feedback": "In Development"
+                        "feedback": "Requires pitch/F0 extraction - In Development"
                     },
                     "chunking_and_rhythm": {
                         "score": 0,
-                        "feedback": "In Development"
-                    },
-                    "mistakes": []
+                        "feedback": "Requires prosodic analysis - In Development"
+                    }
                 },
                 "overall": {
-                    "fluency_and_coherence_score": 0,
-                    "lexical_resource_score": llm_analysis.get("overall_lexical_score", 0),
-                    "grammar_score": llm_analysis.get("overall_grammar_score", 0),
-                    "pronunciation_score": 0,
-                    "band_score": 0,
-                    "summary": "Partial analysis - Fluency/Coherence and Pronunciation are in development."
+                    "fluency_and_coherence_score": fluency_score,
+                    "lexical_resource_score": lexical_score,
+                    "grammar_score": grammar_score,
+                    "pronunciation_score": pronunciation_score,
+                    "band_score": band_score,
+                    "summary": f"Full analysis complete. Intonation/stress and chunking/rhythm require additional audio models."
                 },
-                "filler_words": llm_analysis.get("filler_words", {"count": 0, "words": []}),
+                "filler_words": llm_analysis.get("filler_words", {"count": 0, "words": [], "impact": "Not analyzed"}),
                 "low_confidence_words": low_confidence_words,
                 "average_confidence": avg_confidence
             }
