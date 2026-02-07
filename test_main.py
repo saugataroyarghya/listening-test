@@ -32,9 +32,74 @@ def test_analyze_speech_endpoint_structure():
     assert response.status_code in [200, 500]
 
 
+def test_analyze_speech_file_requires_file():
+    response = client.post("/analyzeSpeechFile")
+    assert response.status_code == 422
+
+
+def test_analyze_speech_file_endpoint_structure(monkeypatch):
+    async def mock_transcribe_from_file_bytes(file_bytes, suffix=".mp3"):
+        return {
+            "text": "I think this is a good example for testing.",
+            "annotated": "I(0.99) think(0.98) this(0.97) is(0.97) a(0.96) good(0.96) example(0.95) for(0.95) testing(0.94)",
+            "words": [
+                {"word": "I", "confidence": 0.99, "start": 0.0, "end": 0.1},
+                {"word": "think", "confidence": 0.98, "start": 0.12, "end": 0.4},
+                {"word": "this", "confidence": 0.97, "start": 0.43, "end": 0.55},
+                {"word": "is", "confidence": 0.97, "start": 0.58, "end": 0.67},
+                {"word": "a", "confidence": 0.96, "start": 0.7, "end": 0.76},
+                {"word": "good", "confidence": 0.96, "start": 0.79, "end": 0.95},
+                {"word": "example", "confidence": 0.95, "start": 0.99, "end": 1.32},
+                {"word": "for", "confidence": 0.95, "start": 1.36, "end": 1.48},
+                {"word": "testing", "confidence": 0.94, "start": 1.52, "end": 1.9},
+            ],
+            "alignment": {"adjusted_words": 0, "overlap_fixes": 0, "duration_fixes": 0, "micro_gap_fixes": 0}
+        }
+
+    def mock_get_ielts_analysis(transcript, annotated, speaking_metrics=None, feature_context=None):
+        return {
+            "fluency_and_coherence": {
+                "fluency": {"score": 7, "feedback": "Good flow."},
+                "topic_development": {"score": 7, "feedback": "Relevant points."},
+                "cohesive_devices": {"score": 7, "feedback": "Adequate linking.", "devices_used": ["for example"]}
+            },
+            "lexical_resource": {
+                "vocabulary_range": {"score": 7, "feedback": "Decent range."},
+                "accuracy": {"score": 7, "feedback": "Mostly accurate."},
+                "idiomatic_language": {"score": 6, "feedback": "Limited idioms."},
+                "vocabulary_mistakes": [],
+                "cefr_level": "B2"
+            },
+            "grammar": {
+                "range_of_structures": {"score": 7, "feedback": "Some complexity."},
+                "grammar_accuracy": {"score": 7, "feedback": "Mostly correct."},
+                "tense_accuracy": {"score": 7, "feedback": "Consistent tense."},
+                "errors": []
+            },
+            "filler_words": {"count": 0, "words": [], "impact": "Minimal"},
+            "overall_fluency_coherence_score": 7,
+            "overall_lexical_score": 7,
+            "overall_grammar_score": 7
+        }
+
+    monkeypatch.setattr("main.transcription_service.transcribe_from_file_bytes", mock_transcribe_from_file_bytes)
+    monkeypatch.setattr("main.groq_service.get_ielts_analysis", mock_get_ielts_analysis)
+
+    response = client.post(
+        "/analyzeSpeechFile",
+        files={"file": ("sample.mp3", b"fake-mp3-bytes", "audio/mpeg")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "transcript" in data
+    assert "words" in data
+    assert "analysis" in data
+    assert "overall" in data["analysis"]
+
+
 def test_speaking_metrics_calculation():
     """Test the speaking metrics calculation from word timestamps"""
-    ws = WhisperService()
+    ws = WhisperService(load_model=False)
 
     # Test with sample word data
     test_words = [
@@ -63,11 +128,13 @@ def test_speaking_metrics_calculation():
     assert metrics["pauses"]["bad_pause_count"] == 1
     assert metrics["pauses"]["bad_pauses"][0]["after_word"] == "is"
     assert metrics["pauses"]["bad_pauses"][0]["duration"] == 1.7
+    assert "fluency_features" in metrics
+    assert metrics["fluency_features"]["mean_length_of_run_words"] > 0
 
 
 def test_speaking_metrics_empty_input():
     """Test speaking metrics with empty or minimal input"""
-    ws = WhisperService()
+    ws = WhisperService(load_model=False)
 
     # Empty list
     metrics = ws.calculate_speaking_metrics([])
@@ -83,7 +150,7 @@ def test_speaking_metrics_empty_input():
 
 def test_pronunciation_clarity_calculation():
     """Test pronunciation clarity based on Whisper confidence scores"""
-    ws = WhisperService()
+    ws = WhisperService(load_model=False)
 
     # Test with mixed confidence scores
     test_words = [
@@ -120,8 +187,46 @@ def test_pronunciation_clarity_calculation():
 
 def test_pronunciation_clarity_empty_input():
     """Test pronunciation clarity with empty input"""
-    ws = WhisperService()
+    ws = WhisperService(load_model=False)
 
     result = ws.calculate_pronunciation_clarity([])
     assert result["clarity"]["score"] == 0
     assert result["clarity"]["feedback"] == "Insufficient data"
+
+
+def test_alignment_refinement_fixes_overlaps():
+    ws = WhisperService(load_model=False)
+    raw_words = [
+        {"word": "I", "confidence": 0.9, "start": 0.0, "end": 0.2},
+        {"word": "think", "confidence": 0.9, "start": 0.18, "end": 0.18},
+        {"word": "so", "confidence": 0.9, "start": 0.21, "end": 0.26},
+    ]
+    refined = ws.refine_word_alignment(raw_words)
+    refined_words = refined["words"]
+    assert refined["alignment"]["adjusted_words"] > 0
+    assert refined_words[1]["start"] >= refined_words[0]["end"]
+    assert refined_words[1]["end"] > refined_words[1]["start"]
+
+
+def test_prosody_lexical_grammar_features_exist():
+    ws = WhisperService(load_model=False)
+    sample_words = [
+        {"word": "I", "confidence": 0.95, "start": 0.0, "end": 0.12},
+        {"word": "believe", "confidence": 0.93, "start": 0.14, "end": 0.46},
+        {"word": "that", "confidence": 0.91, "start": 0.5, "end": 0.62},
+        {"word": "technology", "confidence": 0.9, "start": 0.65, "end": 1.05},
+        {"word": "improves", "confidence": 0.88, "start": 1.4, "end": 1.72},
+        {"word": "education", "confidence": 0.9, "start": 1.76, "end": 2.15},
+    ]
+    transcript = "I believe that technology improves education because students can learn faster."
+
+    prosody = ws.calculate_prosody_features(sample_words)
+    lexical = ws.calculate_lexical_resource(transcript, sample_words)
+    grammar = ws.calculate_grammar_analysis(transcript)
+
+    assert "intonation_and_stress" in prosody
+    assert prosody["intonation_and_stress"]["score"] >= 0
+    assert "overall_lexical_score" in lexical
+    assert lexical["cefr_level"] in {"A1", "A2", "B1", "B2", "C1", "C2", "Unknown"}
+    assert "overall_grammar_score" in grammar
+    assert "errors" in grammar

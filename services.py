@@ -2,6 +2,9 @@ import os
 import json
 import httpx
 import tempfile
+import math
+import re
+import statistics
 from groq import Groq
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
@@ -9,18 +12,110 @@ from faster_whisper import WhisperModel
 load_dotenv()
 
 class WhisperService:
-    def __init__(self):
-        # M4 Mac Optimization - uses CoreML automatically
-        print("Loading Whisper model...")
-        self.model = WhisperModel(
-            "small.en",
-            device="cpu",
-            compute_type="int8",  # Optimized for M4
-        )
-        print("✓ Whisper model loaded")
+    def __init__(self, load_model: bool = True):
+        self.model = None
+        if load_model:
+            # M4 Mac Optimization - uses CoreML automatically
+            print("Loading Whisper model...")
+            self.model = WhisperModel(
+                "small.en",
+                device="cpu",
+                compute_type="int8",  # Optimized for M4
+            )
+            print("✓ Whisper model loaded")
+
+    def _safe_percentile(self, values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        if len(sorted_values) == 1:
+            return round(sorted_values[0], 2)
+        position = (len(sorted_values) - 1) * percentile
+        lower = int(position)
+        upper = min(lower + 1, len(sorted_values) - 1)
+        fraction = position - lower
+        interpolated = sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * fraction
+        return round(interpolated, 2)
+
+    def _clamp_band_score(self, value: float) -> float:
+        return round(max(1.0, min(9.0, value)), 1)
+
+    def _tokenize(self, text: str) -> list[str]:
+        return re.findall(r"[a-zA-Z']+", text.lower())
+
+    def refine_word_alignment(self, words_data: list) -> dict:
+        """
+        Refine noisy Whisper word boundaries into monotonic, stable timings.
+        This is a lightweight alignment-improvement pass when external forced aligners are unavailable.
+        """
+        if not words_data:
+            return {
+                "words": [],
+                "alignment": {
+                    "adjusted_words": 0,
+                    "overlap_fixes": 0,
+                    "duration_fixes": 0,
+                    "micro_gap_fixes": 0
+                }
+            }
+
+        refined_words = []
+        adjusted_words = 0
+        overlap_fixes = 0
+        duration_fixes = 0
+        micro_gap_fixes = 0
+        previous_end = None
+
+        for word_info in words_data:
+            start = float(word_info.get("start", 0.0))
+            end = float(word_info.get("end", start))
+            word_text = str(word_info.get("word", "")).strip()
+            confidence = float(word_info.get("confidence", 0.5))
+
+            estimated_duration = max(0.08, min(0.45, len(word_text) * 0.03))
+
+            if previous_end is not None:
+                gap = start - previous_end
+                if 0 < gap < 0.04:
+                    start = previous_end
+                    micro_gap_fixes += 1
+                    adjusted_words += 1
+                elif gap < 0:
+                    start = previous_end
+                    overlap_fixes += 1
+                    adjusted_words += 1
+
+            if end <= start:
+                end = start + estimated_duration
+                duration_fixes += 1
+                adjusted_words += 1
+
+            if (end - start) < 0.06:
+                end = start + 0.06
+                duration_fixes += 1
+                adjusted_words += 1
+
+            refined_entry = {
+                "word": word_text,
+                "confidence": round(confidence, 2),
+                "start": round(start, 2),
+                "end": round(end, 2)
+            }
+            refined_words.append(refined_entry)
+            previous_end = end
+
+        return {
+            "words": refined_words,
+            "alignment": {
+                "adjusted_words": adjusted_words,
+                "overlap_fixes": overlap_fixes,
+                "duration_fixes": duration_fixes,
+                "micro_gap_fixes": micro_gap_fixes
+            }
+        }
 
     def calculate_speaking_metrics(self, words_data: list) -> dict:
-        """Calculate speaking speed and pause analysis from word timestamps"""
+        """Calculate speaking speed, pauses, and richer fluency metrics."""
         if not words_data or len(words_data) < 2:
             return {
                 "speaking_speed": {
@@ -36,6 +131,20 @@ class WhisperService:
                     "bad_pause_count": 0,
                     "total_pause_time": 0,
                     "feedback": "Insufficient data for pause analysis"
+                },
+                "fluency_features": {
+                    "articulation_rate_wpm": 0,
+                    "phonation_time_ratio": 0,
+                    "mean_length_of_run_words": 0,
+                    "pause_p50_seconds": 0,
+                    "pause_p90_seconds": 0,
+                    "filled_pause_count": 0,
+                    "filled_pause_rate_per_min": 0,
+                    "repetition_count": 0,
+                    "self_correction_markers": 0,
+                    "cohesive_device_count": 0,
+                    "fluency_score": 0,
+                    "feedback": "Insufficient data"
                 }
             }
 
@@ -63,6 +172,7 @@ class WhisperService:
         # Pause analysis
         good_pauses = []  # Natural pauses (0.3s - 1.5s)
         bad_pauses = []   # Hesitation pauses (> 1.5s) or too many short pauses
+        pause_durations = []
 
         total_pause_time = 0
 
@@ -81,6 +191,7 @@ class WhisperService:
                 }
 
                 total_pause_time += gap
+                pause_durations.append(gap)
 
                 if 0.3 <= gap <= 1.5:
                     # Natural pause - good for thought organization
@@ -101,6 +212,78 @@ class WhisperService:
         else:
             pause_feedback = "Frequent hesitations significantly impacting fluency"
 
+        word_durations = [max(0.0, w["end"] - w["start"]) for w in words_data]
+        speech_time = sum(word_durations)
+        articulation_rate_wpm = round((total_words / speech_time) * 60, 1) if speech_time > 0 else 0
+        phonation_ratio = round(speech_time / total_duration, 2) if total_duration > 0 else 0
+
+        run_lengths = []
+        current_run = 1
+        for i in range(1, len(words_data)):
+            gap = words_data[i]["start"] - words_data[i - 1]["end"]
+            if gap > 0.25:
+                run_lengths.append(current_run)
+                current_run = 1
+            else:
+                current_run += 1
+        run_lengths.append(current_run)
+        mean_length_run = round(sum(run_lengths) / len(run_lengths), 2) if run_lengths else 0
+
+        token_stream = [w["word"].lower() for w in words_data]
+        filler_words = {
+            "um", "uh", "hmm", "ah", "er", "like", "basically", "actually", "well"
+        }
+        multi_fillers = {"you know"}
+        filler_count = sum(1 for token in token_stream if token in filler_words)
+        full_text_lower = " ".join(token_stream)
+        for phrase in multi_fillers:
+            filler_count += full_text_lower.count(phrase)
+
+        filled_pause_rate = round(filler_count / (total_duration / 60), 2) if total_duration > 0 else 0
+
+        normalized_tokens = [re.sub(r"[^a-z']", "", t) for t in token_stream]
+        normalized_tokens = [t for t in normalized_tokens if t]
+        repetition_count = 0
+        for i in range(1, len(normalized_tokens)):
+            if normalized_tokens[i] == normalized_tokens[i - 1]:
+                repetition_count += 1
+
+        self_correction_markers = sum(
+            full_text_lower.count(marker)
+            for marker in ["i mean", "sorry", "rather", "or rather", "that is"]
+        )
+        cohesive_devices = {
+            "however", "therefore", "moreover", "furthermore", "meanwhile", "because",
+            "although", "for example", "in addition", "on the other hand", "so", "but"
+        }
+        cohesive_device_count = sum(full_text_lower.count(device) for device in cohesive_devices)
+
+        pause_p50 = self._safe_percentile(pause_durations, 0.5)
+        pause_p90 = self._safe_percentile(pause_durations, 0.9)
+
+        fluency_penalty = 0.0
+        if wpm < 95 or wpm > 190:
+            fluency_penalty += 1.8
+        elif wpm < 110 or wpm > 175:
+            fluency_penalty += 0.8
+        fluency_penalty += min(2.0, len(bad_pauses) * 0.5)
+        fluency_penalty += min(1.2, filled_pause_rate / 8)
+        fluency_penalty += min(1.0, repetition_count * 0.3)
+        if phonation_ratio < 0.55:
+            fluency_penalty += 0.8
+        if mean_length_run < 3:
+            fluency_penalty += 0.7
+
+        fluency_score = self._clamp_band_score(9.0 - fluency_penalty)
+        if fluency_score >= 8:
+            fluency_feedback = "Very fluent pacing with well-managed pauses and strong continuity."
+        elif fluency_score >= 6.5:
+            fluency_feedback = "Generally fluent with occasional hesitation patterns."
+        elif fluency_score >= 5:
+            fluency_feedback = "Moderate fluency with noticeable pauses or repetition."
+        else:
+            fluency_feedback = "Limited fluency with frequent disruptions in speech flow."
+
         return {
             "speaking_speed": {
                 "words_per_minute": wpm,
@@ -115,6 +298,20 @@ class WhisperService:
                 "bad_pause_count": len(bad_pauses),
                 "total_pause_time": round(total_pause_time, 2),
                 "feedback": pause_feedback
+            },
+            "fluency_features": {
+                "articulation_rate_wpm": articulation_rate_wpm,
+                "phonation_time_ratio": phonation_ratio,
+                "mean_length_of_run_words": mean_length_run,
+                "pause_p50_seconds": pause_p50,
+                "pause_p90_seconds": pause_p90,
+                "filled_pause_count": filler_count,
+                "filled_pause_rate_per_min": filled_pause_rate,
+                "repetition_count": repetition_count,
+                "self_correction_markers": self_correction_markers,
+                "cohesive_device_count": cohesive_device_count,
+                "fluency_score": fluency_score,
+                "feedback": fluency_feedback
             }
         }
 
@@ -235,29 +432,376 @@ class WhisperService:
             "unclear_words": unclear_words_sorted
         }
 
+    def calculate_prosody_features(self, words_data: list) -> dict:
+        """Proxy prosody metrics from timing + confidence when raw F0 extraction is unavailable."""
+        if not words_data or len(words_data) < 3:
+            return {
+                "intonation_and_stress": {
+                    "score": 0,
+                    "feedback": "Insufficient data for intonation/stress estimation",
+                    "evidence": {}
+                },
+                "chunking_and_rhythm": {
+                    "score": 0,
+                    "feedback": "Insufficient data for rhythm/chunking estimation",
+                    "evidence": {}
+                }
+            }
+
+        durations = [max(0.01, w["end"] - w["start"]) for w in words_data]
+        avg_duration = statistics.mean(durations)
+        duration_cv = (statistics.pstdev(durations) / avg_duration) if avg_duration > 0 else 0
+
+        gaps = [
+            max(0.0, words_data[i]["start"] - words_data[i - 1]["end"])
+            for i in range(1, len(words_data))
+        ]
+        gap_cv = 0.0
+        if gaps and statistics.mean(gaps) > 0:
+            gap_cv = statistics.pstdev(gaps) / statistics.mean(gaps)
+
+        confidence_values = [w["confidence"] for w in words_data]
+        avg_confidence = statistics.mean(confidence_values) if confidence_values else 0.0
+
+        chunk_lengths = []
+        run = 1
+        for gap in gaps:
+            if gap > 0.35:
+                chunk_lengths.append(run)
+                run = 1
+            else:
+                run += 1
+        chunk_lengths.append(run)
+
+        mean_chunk_length = statistics.mean(chunk_lengths) if chunk_lengths else 0.0
+        chunk_cv = 0.0
+        if chunk_lengths and mean_chunk_length > 0:
+            chunk_cv = statistics.pstdev(chunk_lengths) / mean_chunk_length
+
+        intonation_penalty = 0.0
+        if duration_cv < 0.15:
+            intonation_penalty += 1.5
+        elif duration_cv > 0.75:
+            intonation_penalty += 0.9
+        if avg_confidence < 0.72:
+            intonation_penalty += 0.8
+        if gap_cv > 1.6:
+            intonation_penalty += 0.8
+        intonation_score = self._clamp_band_score(8.5 - intonation_penalty)
+
+        rhythm_penalty = 0.0
+        if mean_chunk_length < 2.5:
+            rhythm_penalty += 1.2
+        elif mean_chunk_length > 12:
+            rhythm_penalty += 0.8
+        if chunk_cv > 0.85:
+            rhythm_penalty += 1.0
+        long_pauses = sum(1 for gap in gaps if gap > 1.5)
+        rhythm_penalty += min(1.5, long_pauses * 0.4)
+        rhythm_score = self._clamp_band_score(8.5 - rhythm_penalty)
+
+        intonation_feedback = (
+            "Prosody appears expressive with stable stress timing."
+            if intonation_score >= 7
+            else "Prosody shows some monotony or unstable stress timing."
+        )
+        rhythm_feedback = (
+            "Speech is chunked naturally with consistent rhythmic flow."
+            if rhythm_score >= 7
+            else "Chunking/rhythm show irregular phrasing or disruptive pauses."
+        )
+
+        return {
+            "intonation_and_stress": {
+                "score": intonation_score,
+                "feedback": intonation_feedback,
+                "evidence": {
+                    "duration_variation_cv": round(duration_cv, 2),
+                    "gap_variation_cv": round(gap_cv, 2),
+                    "average_confidence": round(avg_confidence, 2)
+                }
+            },
+            "chunking_and_rhythm": {
+                "score": rhythm_score,
+                "feedback": rhythm_feedback,
+                "evidence": {
+                    "mean_chunk_length_words": round(mean_chunk_length, 2),
+                    "chunk_variation_cv": round(chunk_cv, 2),
+                    "long_pause_count": long_pauses
+                }
+            }
+        }
+
+    def calculate_lexical_resource(self, transcript: str, words_data: list | None = None) -> dict:
+        """Local lexical analyzer to complement LLM scoring."""
+        tokens = self._tokenize(transcript)
+        total = len(tokens)
+        if total == 0:
+            return {
+                "vocabulary_range": {"score": 0, "feedback": "No lexical data available"},
+                "accuracy": {"score": 0, "feedback": "No lexical data available"},
+                "idiomatic_language": {"score": 0, "feedback": "No lexical data available"},
+                "vocabulary_mistakes": [],
+                "cefr_level": "Unknown",
+                "overall_lexical_score": 0,
+                "local_metrics": {}
+            }
+
+        stopwords = {
+            "the", "a", "an", "and", "or", "but", "if", "then", "so", "to", "of", "in", "on",
+            "for", "at", "with", "is", "are", "was", "were", "be", "been", "being", "it", "this",
+            "that", "i", "you", "he", "she", "we", "they", "my", "your", "our", "their", "me",
+            "him", "her", "them", "as", "from", "by", "about"
+        }
+
+        unique_tokens = set(tokens)
+        ttr = len(unique_tokens) / total
+        window = min(25, total)
+        moving_ttr_values = []
+        if window > 0:
+            for idx in range(0, total - window + 1):
+                segment = tokens[idx:idx + window]
+                moving_ttr_values.append(len(set(segment)) / len(segment))
+        moving_ttr = statistics.mean(moving_ttr_values) if moving_ttr_values else ttr
+
+        content_words = [token for token in tokens if token not in stopwords]
+        sophisticated_words = [token for token in content_words if len(token) >= 7]
+        sophisticated_ratio = (len(sophisticated_words) / len(content_words)) if content_words else 0.0
+
+        idioms = [
+            "on the other hand", "as far as i know", "at the end of the day",
+            "in my opinion", "for instance", "to be honest", "as a result"
+        ]
+        transcript_lower = transcript.lower()
+        idiom_hits = [phrase for phrase in idioms if phrase in transcript_lower]
+
+        frequency_map = {}
+        for token in tokens:
+            frequency_map[token] = frequency_map.get(token, 0) + 1
+        max_frequency = max(frequency_map.values()) if frequency_map else 0
+        repetition_ratio = max_frequency / total if total > 0 else 0
+
+        avg_confidence = None
+        if words_data:
+            confidence_values = [w["confidence"] for w in words_data]
+            if confidence_values:
+                avg_confidence = statistics.mean(confidence_values)
+
+        range_score = 4.5 + (moving_ttr * 5.0) + (sophisticated_ratio * 7.0)
+        range_score = self._clamp_band_score(range_score)
+
+        accuracy_penalty = 0.0
+        if repetition_ratio > 0.14:
+            accuracy_penalty += 1.2
+        elif repetition_ratio > 0.1:
+            accuracy_penalty += 0.6
+        if avg_confidence is not None and avg_confidence < 0.72:
+            accuracy_penalty += 0.7
+        accuracy_score = self._clamp_band_score(8.0 - accuracy_penalty)
+
+        idiomatic_score = self._clamp_band_score(5.5 + min(2.8, len(idiom_hits) * 0.8))
+
+        if moving_ttr >= 0.72 and sophisticated_ratio >= 0.24:
+            cefr_level = "C1"
+        elif moving_ttr >= 0.65 and sophisticated_ratio >= 0.18:
+            cefr_level = "B2"
+        elif moving_ttr >= 0.56:
+            cefr_level = "B1"
+        elif moving_ttr >= 0.48:
+            cefr_level = "A2"
+        else:
+            cefr_level = "A1"
+
+        vocab_mistakes = []
+        if repetition_ratio > 0.12:
+            repeated_word = max(frequency_map, key=frequency_map.get)
+            vocab_mistakes.append({
+                "original": repeated_word,
+                "suggestion": "Use paraphrases or synonyms",
+                "explanation": "High repetition reduces lexical range."
+            })
+
+        overall_lexical = self._clamp_band_score((range_score + accuracy_score + idiomatic_score) / 3)
+
+        return {
+            "vocabulary_range": {
+                "score": range_score,
+                "feedback": "Lexical diversity and sophistication estimated from moving TTR and advanced-word ratio."
+            },
+            "accuracy": {
+                "score": accuracy_score,
+                "feedback": "Lexical accuracy estimated from repetition density and recognition reliability."
+            },
+            "idiomatic_language": {
+                "score": idiomatic_score,
+                "feedback": "Idiomatic/discourse phrase usage inferred from common IELTS-style expressions."
+            },
+            "vocabulary_mistakes": vocab_mistakes,
+            "cefr_level": cefr_level,
+            "overall_lexical_score": overall_lexical,
+            "local_metrics": {
+                "token_count": total,
+                "type_token_ratio": round(ttr, 3),
+                "moving_ttr": round(moving_ttr, 3),
+                "sophisticated_ratio": round(sophisticated_ratio, 3),
+                "idiom_count": len(idiom_hits),
+                "repetition_ratio": round(repetition_ratio, 3)
+            }
+        }
+
+    def calculate_grammar_analysis(self, transcript: str) -> dict:
+        """Local spoken-grammar analyzer with lightweight error heuristics."""
+        tokens = self._tokenize(transcript)
+        if not tokens:
+            return {
+                "range_of_structures": {"score": 0, "feedback": "No grammar data available"},
+                "grammar_accuracy": {"score": 0, "feedback": "No grammar data available"},
+                "tense_accuracy": {"score": 0, "feedback": "No grammar data available"},
+                "errors": [],
+                "overall_grammar_score": 0,
+                "local_metrics": {}
+            }
+
+        sentences = [part.strip() for part in re.split(r"[.!?]+", transcript) if part.strip()]
+        if not sentences:
+            sentences = [transcript.strip()]
+
+        subordinators = {
+            "because", "although", "while", "whereas", "unless", "since", "if", "when", "after", "before"
+        }
+        sentence_tokens = [self._tokenize(sentence) for sentence in sentences]
+        sentence_lengths = [len(sentence) for sentence in sentence_tokens if sentence]
+        avg_sentence_length = statistics.mean(sentence_lengths) if sentence_lengths else len(tokens)
+        clause_marker_count = sum(sum(1 for token in sentence if token in subordinators) for sentence in sentence_tokens)
+        complex_sentence_count = sum(1 for sentence in sentence_tokens if any(token in subordinators for token in sentence))
+        complex_sentence_ratio = (
+            complex_sentence_count / len(sentence_tokens) if sentence_tokens else 0.0
+        )
+
+        errors = []
+        lower_text = transcript.lower()
+
+        for match in re.finditer(r"\b(i)\s+is\b", lower_text):
+            errors.append({
+                "original": match.group(0),
+                "correction": "I am",
+                "type": "grammar",
+                "explanation": "Subject-verb agreement mismatch."
+            })
+        for match in re.finditer(r"\b(he|she|it)\s+(are|have)\b", lower_text):
+            subject = match.group(1)
+            verb = match.group(2)
+            replacement = "has" if verb == "have" else "is"
+            errors.append({
+                "original": match.group(0),
+                "correction": f"{subject} {replacement}",
+                "type": "grammar",
+                "explanation": "Third-person singular agreement issue."
+            })
+        for match in re.finditer(r"\ba\s+[aeiou]\w*\b", lower_text):
+            errors.append({
+                "original": match.group(0),
+                "correction": match.group(0).replace("a ", "an ", 1),
+                "type": "grammar",
+                "explanation": "Article usage before a vowel sound may be incorrect."
+            })
+        for match in re.finditer(r"\ban\s+[b-df-hj-np-tv-z]\w*\b", lower_text):
+            errors.append({
+                "original": match.group(0),
+                "correction": match.group(0).replace("an ", "a ", 1),
+                "type": "grammar",
+                "explanation": "Article usage before a consonant sound may be incorrect."
+            })
+        for match in re.finditer(r"\bdid\s+\w+ed\b", lower_text):
+            errors.append({
+                "original": match.group(0),
+                "correction": "did + base verb",
+                "type": "tense",
+                "explanation": "After 'did', the base form is typically expected."
+            })
+        for match in re.finditer(r"\b(\w+)\s+\1\b", lower_text):
+            if len(match.group(1)) > 2:
+                errors.append({
+                    "original": match.group(0),
+                    "correction": match.group(1),
+                    "type": "syntax",
+                    "explanation": "Word repetition can indicate a false start or grammatical disfluency."
+                })
+
+        errors = errors[:12]
+
+        range_score = self._clamp_band_score(
+            4.5 + (complex_sentence_ratio * 4.0) + min(1.5, clause_marker_count * 0.25)
+        )
+
+        error_density = (len(errors) / len(tokens)) * 100 if tokens else 0.0
+        accuracy_penalty = min(4.0, error_density / 6.0)
+        accuracy_score = self._clamp_band_score(8.5 - accuracy_penalty)
+
+        past_markers = {"was", "were", "had", "did", "went", "made", "saw"}
+        present_markers = {"is", "are", "am", "do", "does", "have", "has", "go", "goes"}
+        past_count = sum(1 for token in tokens if token in past_markers or token.endswith("ed"))
+        present_count = sum(1 for token in tokens if token in present_markers)
+        marker_total = past_count + present_count
+        tense_consistency = (max(past_count, present_count) / marker_total) if marker_total > 0 else 1.0
+        tense_score = self._clamp_band_score(4.0 + (tense_consistency * 5.0))
+
+        overall_grammar = self._clamp_band_score((range_score + accuracy_score + tense_score) / 3)
+
+        return {
+            "range_of_structures": {
+                "score": range_score,
+                "feedback": "Structural range estimated from sentence complexity and subordination usage."
+            },
+            "grammar_accuracy": {
+                "score": accuracy_score,
+                "feedback": "Accuracy estimated from heuristic agreement/article/tense pattern checks."
+            },
+            "tense_accuracy": {
+                "score": tense_score,
+                "feedback": "Tense consistency estimated from distribution of present vs past markers."
+            },
+            "errors": errors,
+            "overall_grammar_score": overall_grammar,
+            "local_metrics": {
+                "sentence_count": len(sentences),
+                "average_sentence_length": round(avg_sentence_length, 2),
+                "complex_sentence_ratio": round(complex_sentence_ratio, 3),
+                "clause_marker_count": clause_marker_count,
+                "error_density_per_100_words": round(error_density, 2),
+                "tense_consistency": round(tense_consistency, 3)
+            }
+        }
+
     async def transcribe_from_url(self, url: str):
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+        return await self.transcribe_from_file_bytes(response.content, suffix=".mp3")
+
+    async def transcribe_from_file_bytes(self, file_bytes: bytes, suffix: str = ".mp3"):
         temp_path = None
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-                    temp_audio.write(response.content)
-                    temp_path = temp_audio.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+                temp_audio.write(file_bytes)
+                temp_path = temp_audio.name
 
-            full_text, annotated, words_data = self.transcribe_with_confidence(temp_path)
+            full_text, annotated, words_data, alignment_meta = self.transcribe_with_confidence(temp_path)
 
             return {
                 "text": full_text,
                 "annotated": annotated,
-                "words": words_data
+                "words": words_data,
+                "alignment": alignment_meta
             }
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
     def transcribe_with_confidence(self, audio_path: str):
+        if self.model is None:
+            raise RuntimeError("Whisper model is not loaded")
+
         # Transcribe with word-level timestamps
         segments, info = self.model.transcribe(
             audio_path,
@@ -281,7 +825,6 @@ class WhisperService:
                 # Get confidence (probability)
                 confidence = word.probability
 
-                import math
                 if math.isnan(confidence):
                     confidence = 0.5
 
@@ -296,7 +839,14 @@ class WhisperService:
                     "end": round(word.end, 2)
                 })
 
-        return " ".join(full_text), " ".join(annotated_transcript), words_data
+        alignment_result = self.refine_word_alignment(words_data)
+        refined_words = alignment_result["words"]
+        alignment_meta = alignment_result["alignment"]
+
+        refined_text = [entry["word"] for entry in refined_words]
+        refined_annotated = [f"{entry['word']}({entry['confidence']})" for entry in refined_words]
+
+        return " ".join(refined_text), " ".join(refined_annotated), refined_words, alignment_meta
 
 
 class GroqService:
@@ -307,7 +857,13 @@ class GroqService:
         self.client = Groq(api_key=api_key) if api_key else None
         self.model_id = "llama-3.3-70b-versatile"
 
-    def get_ielts_analysis(self, transcript: str, annotated: str, speaking_metrics: dict = None):
+    def get_ielts_analysis(
+        self,
+        transcript: str,
+        annotated: str,
+        speaking_metrics: dict = None,
+        feature_context: dict = None
+    ):
         """Analyze speech for IELTS scoring - Fluency, Lexical Resource, and Grammar"""
         if not self.client:
             return {"error": "Groq API key not configured"}
@@ -327,6 +883,27 @@ SPEAKING METRICS (calculated from audio timestamps):
 - Bad pauses (hesitations >1.5s): {pauses.get('bad_pause_count', 0)}
 - Total pause time: {pauses.get('total_pause_time', 0)} seconds
 - Pause feedback: {pauses.get('feedback', 'N/A')}
+"""
+
+        feature_context_text = ""
+        if feature_context:
+            fluency = feature_context.get("fluency_features", {})
+            pronunciation = feature_context.get("prosody_features", {})
+            lexical = feature_context.get("lexical_metrics", {})
+            grammar = feature_context.get("grammar_metrics", {})
+            feature_context_text = f"""
+DETERMINISTIC FEATURE CONTEXT (use these as supporting evidence):
+- Fluency score estimate: {fluency.get('fluency_score', 0)}
+- Articulation rate: {fluency.get('articulation_rate_wpm', 0)} WPM
+- Phonation time ratio: {fluency.get('phonation_time_ratio', 0)}
+- Mean length of run: {fluency.get('mean_length_of_run_words', 0)} words
+- Filled pause rate: {fluency.get('filled_pause_rate_per_min', 0)} per minute
+- Intonation/stress proxy score: {pronunciation.get('intonation_and_stress', {}).get('score', 0)}
+- Chunking/rhythm proxy score: {pronunciation.get('chunking_and_rhythm', {}).get('score', 0)}
+- Lexical moving TTR: {lexical.get('moving_ttr', 0)}
+- Lexical sophistication ratio: {lexical.get('sophisticated_ratio', 0)}
+- Grammar complex sentence ratio: {grammar.get('complex_sentence_ratio', 0)}
+- Grammar tense consistency: {grammar.get('tense_consistency', 0)}
 """
 
         system_message = """You are an expert IELTS speaking examiner. Analyze the transcript and provide detailed feedback.
@@ -437,7 +1014,8 @@ Analyze this IELTS speaking sample for:
 2. Lexical Resource (vocabulary range, accuracy, idiomatic language, CEFR level)
 3. Grammar (range of structures, grammar accuracy, tense accuracy, specific errors)
 
-Use the speaking metrics provided to inform your fluency assessment.
+Use the speaking metrics and deterministic feature context provided to inform your fluency, lexical, and grammar assessments.
+If your judgment differs from feature estimates, explain why in feedback.
 Provide detailed, constructive feedback with specific examples from the transcript.
 """
 
@@ -445,7 +1023,7 @@ Provide detailed, constructive feedback with specific examples from the transcri
             model=self.model_id,
             messages=[
                 {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": f"{prompt}\n{feature_context_text}"}
             ],
             response_format={"type": "json_object"},
             temperature=0.5,

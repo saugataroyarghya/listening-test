@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from services import transcription_service, groq_service
 from dotenv import load_dotenv
 import uvicorn
@@ -13,6 +13,135 @@ app = FastAPI(
 
 DEFAULT_SPEECH_URL = "https://pronunciationstudio.com/wp-content/uploads/2016/02/Audio-Introduction-0.1.mp3"
 
+
+def combine_scores(llm_score: float, local_score: float, llm_weight: float = 0.6) -> float:
+    if llm_score > 0 and local_score > 0:
+        return round((llm_score * llm_weight) + (local_score * (1 - llm_weight)), 1)
+    if llm_score > 0:
+        return round(llm_score, 1)
+    if local_score > 0:
+        return round(local_score, 1)
+    return 0.0
+
+
+def build_analysis_response(result: dict) -> dict:
+    words_data = result["words"]
+
+    speaking_metrics = transcription_service.calculate_speaking_metrics(words_data)
+    pronunciation_clarity = transcription_service.calculate_pronunciation_clarity(words_data)
+    prosody_features = transcription_service.calculate_prosody_features(words_data)
+    local_lexical = transcription_service.calculate_lexical_resource(result["text"], words_data)
+    local_grammar = transcription_service.calculate_grammar_analysis(result["text"])
+
+    llm_analysis = groq_service.get_ielts_analysis(
+        transcript=result["text"],
+        annotated=result["annotated"],
+        speaking_metrics=speaking_metrics,
+        feature_context={
+            "fluency_features": speaking_metrics.get("fluency_features", {}),
+            "prosody_features": prosody_features,
+            "lexical_metrics": local_lexical.get("local_metrics", {}),
+            "grammar_metrics": local_grammar.get("local_metrics", {})
+        }
+    )
+
+    confidences = [w["confidence"] for w in words_data]
+    avg_confidence = round(sum(confidences) / len(confidences), 2) if confidences else 0
+    low_confidence_words = [
+        {"word": w["word"], "confidence": w["confidence"]}
+        for w in words_data if w["confidence"] < 0.7
+    ]
+
+    llm_fluency = llm_analysis.get("fluency_and_coherence", {})
+    cohesive_devices_data = llm_fluency.get("cohesive_devices", {
+        "score": 0,
+        "feedback": "Analysis failed",
+        "devices_used": []
+    })
+
+    local_fluency_score = speaking_metrics.get("fluency_features", {}).get("fluency_score", 0)
+    llm_fluency_score = llm_analysis.get("overall_fluency_coherence_score", 0)
+    fluency_score = combine_scores(llm_fluency_score, local_fluency_score)
+
+    llm_lexical_score = llm_analysis.get("overall_lexical_score", 0)
+    local_lexical_score = local_lexical.get("overall_lexical_score", 0)
+    lexical_score = combine_scores(llm_lexical_score, local_lexical_score)
+
+    llm_grammar_score = llm_analysis.get("overall_grammar_score", 0)
+    local_grammar_score = local_grammar.get("overall_grammar_score", 0)
+    grammar_score = combine_scores(llm_grammar_score, local_grammar_score)
+
+    pronunciation_score = round(
+        (
+            pronunciation_clarity["clarity"]["score"] +
+            prosody_features["intonation_and_stress"]["score"] +
+            prosody_features["chunking_and_rhythm"]["score"]
+        ) / 3,
+        1
+    )
+
+    available_scores = [s for s in [fluency_score, lexical_score, grammar_score, pronunciation_score] if s > 0]
+    band_score = round(sum(available_scores) / len(available_scores), 1) if available_scores else 0
+
+    return {
+        "transcript": result["text"],
+        "words": words_data,
+        "alignment": result.get("alignment", {}),
+        "analysis": {
+            "fluency_and_coherence": {
+                "fluency": llm_fluency.get("fluency", {
+                    "score": 0,
+                    "feedback": "Analysis failed"
+                }),
+                "topic_development": llm_fluency.get("topic_development", {
+                    "score": 0,
+                    "feedback": "Analysis failed"
+                }),
+                "cohesive_devices": cohesive_devices_data,
+                "pauses": speaking_metrics["pauses"],
+                "speaking_speed": speaking_metrics["speaking_speed"],
+                "fluency_features": speaking_metrics.get("fluency_features", {})
+            },
+            "lexical_resource": {
+                "llm": llm_analysis.get("lexical_resource", {
+                    "vocabulary_range": {"score": 0, "feedback": "Analysis failed"},
+                    "accuracy": {"score": 0, "feedback": "Analysis failed"},
+                    "idiomatic_language": {"score": 0, "feedback": "Analysis failed"},
+                    "vocabulary_mistakes": [],
+                    "cefr_level": "Unknown"
+                }),
+                "local": local_lexical
+            },
+            "grammar": {
+                "llm": llm_analysis.get("grammar", {
+                    "range_of_structures": {"score": 0, "feedback": "Analysis failed"},
+                    "grammar_accuracy": {"score": 0, "feedback": "Analysis failed"},
+                    "tense_accuracy": {"score": 0, "feedback": "Analysis failed"},
+                    "errors": []
+                }),
+                "local": local_grammar
+            },
+            "pronunciation": {
+                "clarity": pronunciation_clarity["clarity"],
+                "word_counts": pronunciation_clarity["word_counts"],
+                "unclear_words": pronunciation_clarity["unclear_words"],
+                "intonation_and_stress": prosody_features["intonation_and_stress"],
+                "chunking_and_rhythm": prosody_features["chunking_and_rhythm"]
+            },
+            "overall": {
+                "fluency_and_coherence_score": fluency_score,
+                "lexical_resource_score": lexical_score,
+                "grammar_score": grammar_score,
+                "pronunciation_score": pronunciation_score,
+                "band_score": band_score,
+                "summary": "Hybrid scoring complete using deterministic features + LLM rubric analysis."
+            },
+            "filler_words": llm_analysis.get("filler_words", {"count": 0, "words": [], "impact": "Not analyzed"}),
+            "low_confidence_words": low_confidence_words,
+            "average_confidence": avg_confidence
+        }
+    }
+
 @app.get("/")
 async def root():
     """API information"""
@@ -20,6 +149,7 @@ async def root():
         "message": "Speech Analysis API",
         "endpoints": {
             "/analyzeSpeech": "Transcribe and analyze speech from audio URL",
+            "/analyzeSpeechFile": "Transcribe and analyze speech from uploaded file",
             "/health": "Health check"
         }
     }
@@ -54,110 +184,32 @@ async def analyze_speech(
         - Overall band scores (1-9 scale)
     """
     try:
-        # 1. Transcribe with Whisper
         result = await transcription_service.transcribe_from_url(url)
-        words_data = result["words"]
+        return build_analysis_response(result)
 
-        # 2. Calculate speaking metrics from timestamps
-        speaking_metrics = transcription_service.calculate_speaking_metrics(words_data)
-
-        # 3. Calculate pronunciation clarity from Whisper confidence scores
-        pronunciation_clarity = transcription_service.calculate_pronunciation_clarity(words_data)
-
-        # 4. Get IELTS analysis from Groq (now includes fluency analysis)
-        llm_analysis = groq_service.get_ielts_analysis(
-            transcript=result["text"],
-            annotated=result["annotated"],
-            speaking_metrics=speaking_metrics
-        )
-
-        # 5. Calculate confidence metrics from words
-        confidences = [w["confidence"] for w in words_data]
-        avg_confidence = round(sum(confidences) / len(confidences), 2) if confidences else 0
-        low_confidence_words = [
-            {"word": w["word"], "confidence": w["confidence"]}
-            for w in words_data if w["confidence"] < 0.7
-        ]
-
-        # 6. Extract LLM fluency analysis with fallbacks
-        llm_fluency = llm_analysis.get("fluency_and_coherence", {})
-
-        # Get cohesive devices from LLM
-        cohesive_devices_data = llm_fluency.get("cohesive_devices", {
-            "score": 0,
-            "feedback": "Analysis failed",
-            "devices_used": []
-        })
-
-        # 7. Calculate overall scores
-        fluency_score = llm_analysis.get("overall_fluency_coherence_score", 0)
-        lexical_score = llm_analysis.get("overall_lexical_score", 0)
-        grammar_score = llm_analysis.get("overall_grammar_score", 0)
-        pronunciation_score = pronunciation_clarity["clarity"]["score"]
-
-        # Calculate band score (now includes pronunciation clarity!)
-        available_scores = [s for s in [fluency_score, lexical_score, grammar_score, pronunciation_score] if s > 0]
-        band_score = round(sum(available_scores) / len(available_scores), 1) if available_scores else 0
-
-        # 7. Build the full IELTS response structure
-        response = {
-            "transcript": result["text"],
-            "words": words_data,
-            "analysis": {
-                "fluency_and_coherence": {
-                    "fluency": llm_fluency.get("fluency", {
-                        "score": 0,
-                        "feedback": "Analysis failed"
-                    }),
-                    "topic_development": llm_fluency.get("topic_development", {
-                        "score": 0,
-                        "feedback": "Analysis failed"
-                    }),
-                    "cohesive_devices": cohesive_devices_data,
-                    "pauses": speaking_metrics["pauses"],
-                    "speaking_speed": speaking_metrics["speaking_speed"]
-                },
-                "lexical_resource": llm_analysis.get("lexical_resource", {
-                    "vocabulary_range": {"score": 0, "feedback": "Analysis failed"},
-                    "accuracy": {"score": 0, "feedback": "Analysis failed"},
-                    "idiomatic_language": {"score": 0, "feedback": "Analysis failed"},
-                    "vocabulary_mistakes": [],
-                    "cefr_level": "Unknown"
-                }),
-                "grammar": llm_analysis.get("grammar", {
-                    "range_of_structures": {"score": 0, "feedback": "Analysis failed"},
-                    "grammar_accuracy": {"score": 0, "feedback": "Analysis failed"},
-                    "tense_accuracy": {"score": 0, "feedback": "Analysis failed"},
-                    "errors": []
-                }),
-                "pronunciation": {
-                    "clarity": pronunciation_clarity["clarity"],
-                    "word_counts": pronunciation_clarity["word_counts"],
-                    "unclear_words": pronunciation_clarity["unclear_words"],
-                    "intonation_and_stress": {
-                        "score": 0,
-                        "feedback": "Requires pitch/F0 extraction - In Development"
-                    },
-                    "chunking_and_rhythm": {
-                        "score": 0,
-                        "feedback": "Requires prosodic analysis - In Development"
-                    }
-                },
-                "overall": {
-                    "fluency_and_coherence_score": fluency_score,
-                    "lexical_resource_score": lexical_score,
-                    "grammar_score": grammar_score,
-                    "pronunciation_score": pronunciation_score,
-                    "band_score": band_score,
-                    "summary": f"Full analysis complete. Intonation/stress and chunking/rhythm require additional audio models."
-                },
-                "filler_words": llm_analysis.get("filler_words", {"count": 0, "words": [], "impact": "Not analyzed"}),
-                "low_confidence_words": low_confidence_words,
-                "average_confidence": avg_confidence
-            }
+    except Exception as e:
+        import traceback
+        error_detail = {
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
         }
+        raise HTTPException(status_code=500, detail=error_detail)
 
-        return response
+
+@app.post("/analyzeSpeechFile")
+async def analyze_speech_file(file: UploadFile = File(...)):
+    """
+    Transcribe and analyze speech from an uploaded MP3/audio file.
+    """
+    try:
+        suffix = ".mp3"
+        if file.filename and "." in file.filename:
+            suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
+
+        file_bytes = await file.read()
+        result = await transcription_service.transcribe_from_file_bytes(file_bytes, suffix=suffix)
+        return build_analysis_response(result)
 
     except Exception as e:
         import traceback
