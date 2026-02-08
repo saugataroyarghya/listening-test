@@ -230,3 +230,25 @@ def test_prosody_lexical_grammar_features_exist():
     assert lexical["cefr_level"] in {"A1", "A2", "B1", "B2", "C1", "C2", "Unknown"}
     assert "overall_grammar_score" in grammar
     assert "errors" in grammar
+
+
+def test_lexical_deterministic_cefr_metadata():
+    ws = WhisperService(load_model=False)
+    transcript = (
+        "In my opinion, technology and education are important because they improve communication "
+        "and create opportunities for society."
+    )
+    lexical = ws.calculate_lexical_resource(transcript)
+    assert "deterministic_confidence" in lexical
+    assert 0 <= lexical["deterministic_confidence"] <= 1
+    assert lexical["local_metrics"]["engine"] == "cefr_lexicon"
+    assert "cefr_coverage" in lexical["local_metrics"]
+
+
+def test_grammar_deterministic_metadata():
+    ws = WhisperService(load_model=False)
+    grammar = ws.calculate_grammar_analysis("He are late and I is tired.")
+    assert "deterministic_confidence" in grammar
+    assert 0 <= grammar["deterministic_confidence"] <= 1
+    assert "engine" in grammar["local_metrics"]
+    assert any(err["type"] == "grammar" for err in grammar["errors"])

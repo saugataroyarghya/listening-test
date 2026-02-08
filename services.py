@@ -8,12 +8,64 @@ import statistics
 from groq import Groq
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
+try:
+    import language_tool_python
+except ImportError:
+    language_tool_python = None
 
 load_dotenv()
+
+CEFR_LEXICON = {
+    "A1": {
+        "i", "you", "he", "she", "we", "they", "my", "your", "our", "their", "name", "age", "family", "mother",
+        "father", "brother", "sister", "friend", "home", "house", "room", "school", "student", "teacher", "book",
+        "pen", "water", "food", "bread", "rice", "milk", "coffee", "tea", "day", "week", "month", "year", "today",
+        "tomorrow", "morning", "night", "city", "country", "work", "job", "happy", "sad", "big", "small", "good",
+        "bad", "new", "old", "go", "come", "eat", "drink", "read", "write", "speak", "listen", "watch", "play",
+        "like", "love", "want", "need", "can", "have", "make", "do", "get", "give", "take", "buy", "open", "close"
+    },
+    "A2": {
+        "usually", "sometimes", "always", "never", "often", "quickly", "slowly", "carefully", "holiday", "travel",
+        "station", "airport", "ticket", "weather", "season", "market", "supermarket", "restaurant", "menu", "order",
+        "breakfast", "lunch", "dinner", "exercise", "healthy", "problem", "important", "different", "beautiful",
+        "interesting", "exciting", "boring", "choose", "decide", "arrive", "leave", "begin", "finish", "remember",
+        "forget", "explain", "describe", "agree", "answer", "question", "visit", "plan", "practice", "improve",
+        "future", "past", "present", "experience", "example", "reason", "because", "although", "before", "after",
+        "during", "without", "between", "around", "through", "toward"
+    },
+    "B1": {
+        "opinion", "advantage", "disadvantage", "environment", "education", "technology", "internet", "communication",
+        "develop", "increase", "reduce", "support", "compare", "suggest", "prefer", "recommend", "consider", "achieve",
+        "opportunity", "challenge", "solution", "result", "influence", "impact", "society", "community", "government",
+        "economy", "culture", "tradition", "behavior", "responsible", "effective", "convenient", "available", "typical",
+        "general", "specific", "frequently", "probably", "possibly", "clearly", "mainly", "however", "therefore",
+        "meanwhile", "instead", "further", "improvement", "progress", "ability", "knowledge", "skill", "project"
+    },
+    "B2": {
+        "significant", "consequence", "perspective", "motivation", "efficient", "flexible", "reliable", "sustainable",
+        "innovative", "appropriate", "fundamental", "essential", "complex", "analysis", "evaluate", "justify",
+        "demonstrate", "maintain", "establish", "contribute", "participate", "alternative", "approach", "strategy",
+        "resource", "global", "domestic", "financial", "academic", "professional", "circumstance", "interaction",
+        "awareness", "priority", "standard", "evidence", "argument", "assumption", "distribution", "regulation",
+        "policy", "research", "practical", "logical", "conclusion", "consequently", "moreover", "whereas"
+    },
+    "C1": {
+        "substantial", "inevitable", "predominant", "comprehensive", "controversial", "plausible", "coherent",
+        "ambiguous", "diminish", "facilitate", "implement", "allocate", "synthesize", "articulate", "scrutinize",
+        "correlation", "implication", "parameter", "framework", "paradigm", "infrastructure", "methodology",
+        "intervention", "constraint", "discrepancy", "proficiency", "competence", "institutional", "multifaceted",
+        "socioeconomic", "contemporary", "notwithstanding", "nonetheless", "conversely", "subsequently", "ultimately"
+    },
+}
+
+CEFR_ORDER = ["A1", "A2", "B1", "B2", "C1"]
+CEFR_WEIGHT = {"A1": 1.0, "A2": 2.0, "B1": 3.0, "B2": 4.0, "C1": 5.0}
 
 class WhisperService:
     def __init__(self, load_model: bool = True):
         self.model = None
+        self._language_tool = None
+        self._language_tool_failed = False
         if load_model:
             # M4 Mac Optimization - uses CoreML automatically
             print("Loading Whisper model...")
@@ -42,6 +94,69 @@ class WhisperService:
 
     def _tokenize(self, text: str) -> list[str]:
         return re.findall(r"[a-zA-Z']+", text.lower())
+
+    def _get_language_tool(self):
+        if language_tool_python is None or self._language_tool_failed:
+            return None
+        if self._language_tool is not None:
+            return self._language_tool
+        try:
+            self._language_tool = language_tool_python.LanguageTool("en-US")
+            return self._language_tool
+        except Exception:
+            self._language_tool_failed = True
+            return None
+
+    def _score_cefr_from_lexicon(self, tokens: list[str]) -> dict:
+        content_tokens = [token for token in tokens if len(token) > 2]
+        if not content_tokens:
+            return {
+                "cefr_level": "A1",
+                "coverage": 0.0,
+                "difficulty_score": 1.0,
+                "unknown_ratio": 1.0,
+                "level_counts": {level: 0 for level in CEFR_ORDER}
+            }
+
+        level_counts = {level: 0 for level in CEFR_ORDER}
+        matched = 0
+        weighted_sum = 0.0
+        unknown_count = 0
+        for token in content_tokens:
+            matched_level = None
+            for level in reversed(CEFR_ORDER):
+                if token in CEFR_LEXICON[level]:
+                    matched_level = level
+                    break
+            if matched_level:
+                matched += 1
+                level_counts[matched_level] += 1
+                weighted_sum += CEFR_WEIGHT[matched_level]
+            else:
+                unknown_count += 1
+
+        coverage = matched / len(content_tokens)
+        unknown_ratio = unknown_count / len(content_tokens)
+        difficulty_score = weighted_sum / matched if matched > 0 else 1.0
+
+        if difficulty_score >= 4.6 and coverage >= 0.18:
+            cefr_level = "C1"
+        elif difficulty_score >= 3.6 and coverage >= 0.22:
+            cefr_level = "B2"
+        elif difficulty_score >= 2.6 and coverage >= 0.28:
+            cefr_level = "B1"
+        elif difficulty_score >= 1.8 and coverage >= 0.32:
+            cefr_level = "A2"
+        else:
+            cefr_level = "A1"
+
+        return {
+            "cefr_level": cefr_level,
+            "coverage": round(coverage, 3),
+            "difficulty_score": round(difficulty_score, 3),
+            "unknown_ratio": round(unknown_ratio, 3),
+            "level_counts": level_counts
+        }
 
     def refine_word_alignment(self, words_data: list) -> dict:
         """
@@ -533,7 +648,7 @@ class WhisperService:
         }
 
     def calculate_lexical_resource(self, transcript: str, words_data: list | None = None) -> dict:
-        """Local lexical analyzer to complement LLM scoring."""
+        """Deterministic lexical analyzer with CEFR lexicon scoring."""
         tokens = self._tokenize(transcript)
         total = len(tokens)
         if total == 0:
@@ -544,7 +659,8 @@ class WhisperService:
                 "vocabulary_mistakes": [],
                 "cefr_level": "Unknown",
                 "overall_lexical_score": 0,
-                "local_metrics": {}
+                "deterministic_confidence": 0.0,
+                "local_metrics": {"engine": "cefr_lexicon"}
             }
 
         stopwords = {
@@ -567,6 +683,7 @@ class WhisperService:
         content_words = [token for token in tokens if token not in stopwords]
         sophisticated_words = [token for token in content_words if len(token) >= 7]
         sophisticated_ratio = (len(sophisticated_words) / len(content_words)) if content_words else 0.0
+        cefr_result = self._score_cefr_from_lexicon(tokens)
 
         idioms = [
             "on the other hand", "as far as i know", "at the end of the day",
@@ -587,7 +704,9 @@ class WhisperService:
             if confidence_values:
                 avg_confidence = statistics.mean(confidence_values)
 
-        range_score = 4.5 + (moving_ttr * 5.0) + (sophisticated_ratio * 7.0)
+        cefr_weighted_range = 4.2 + (cefr_result["difficulty_score"] * 0.95)
+        diversity_range = 2.4 + (moving_ttr * 5.1) + (sophisticated_ratio * 3.1)
+        range_score = (cefr_weighted_range * 0.65) + (diversity_range * 0.35)
         range_score = self._clamp_band_score(range_score)
 
         accuracy_penalty = 0.0
@@ -597,20 +716,12 @@ class WhisperService:
             accuracy_penalty += 0.6
         if avg_confidence is not None and avg_confidence < 0.72:
             accuracy_penalty += 0.7
+        if cefr_result["unknown_ratio"] > 0.75:
+            accuracy_penalty += 0.5
         accuracy_score = self._clamp_band_score(8.0 - accuracy_penalty)
 
         idiomatic_score = self._clamp_band_score(5.5 + min(2.8, len(idiom_hits) * 0.8))
-
-        if moving_ttr >= 0.72 and sophisticated_ratio >= 0.24:
-            cefr_level = "C1"
-        elif moving_ttr >= 0.65 and sophisticated_ratio >= 0.18:
-            cefr_level = "B2"
-        elif moving_ttr >= 0.56:
-            cefr_level = "B1"
-        elif moving_ttr >= 0.48:
-            cefr_level = "A2"
-        else:
-            cefr_level = "A1"
+        cefr_level = cefr_result["cefr_level"]
 
         vocab_mistakes = []
         if repetition_ratio > 0.12:
@@ -620,17 +731,24 @@ class WhisperService:
                 "suggestion": "Use paraphrases or synonyms",
                 "explanation": "High repetition reduces lexical range."
             })
+        if cefr_result["coverage"] < 0.22:
+            vocab_mistakes.append({
+                "original": "lexicon_coverage",
+                "suggestion": "Use a wider range of common academic and topic-specific terms",
+                "explanation": "Too many tokens fall outside known CEFR lexicons, reducing confidence in level estimation."
+            })
 
         overall_lexical = self._clamp_band_score((range_score + accuracy_score + idiomatic_score) / 3)
+        deterministic_confidence = min(1.0, max(0.0, (cefr_result["coverage"] * 0.7) + (1 - repetition_ratio) * 0.3))
 
         return {
             "vocabulary_range": {
                 "score": range_score,
-                "feedback": "Lexical diversity and sophistication estimated from moving TTR and advanced-word ratio."
+                "feedback": "Deterministic score from CEFR lexicon difficulty blended with lexical diversity."
             },
             "accuracy": {
                 "score": accuracy_score,
-                "feedback": "Lexical accuracy estimated from repetition density and recognition reliability."
+                "feedback": "Deterministic score from repetition, confidence reliability, and lexicon coverage."
             },
             "idiomatic_language": {
                 "score": idiomatic_score,
@@ -639,18 +757,24 @@ class WhisperService:
             "vocabulary_mistakes": vocab_mistakes,
             "cefr_level": cefr_level,
             "overall_lexical_score": overall_lexical,
+            "deterministic_confidence": round(deterministic_confidence, 3),
             "local_metrics": {
                 "token_count": total,
                 "type_token_ratio": round(ttr, 3),
                 "moving_ttr": round(moving_ttr, 3),
                 "sophisticated_ratio": round(sophisticated_ratio, 3),
                 "idiom_count": len(idiom_hits),
-                "repetition_ratio": round(repetition_ratio, 3)
+                "repetition_ratio": round(repetition_ratio, 3),
+                "cefr_coverage": cefr_result["coverage"],
+                "cefr_difficulty_score": cefr_result["difficulty_score"],
+                "cefr_unknown_ratio": cefr_result["unknown_ratio"],
+                "cefr_level_counts": cefr_result["level_counts"],
+                "engine": "cefr_lexicon"
             }
         }
 
     def calculate_grammar_analysis(self, transcript: str) -> dict:
-        """Local spoken-grammar analyzer with lightweight error heuristics."""
+        """Deterministic grammar analyzer with LanguageTool (if available) + heuristic fallback."""
         tokens = self._tokenize(transcript)
         if not tokens:
             return {
@@ -659,7 +783,8 @@ class WhisperService:
                 "tense_accuracy": {"score": 0, "feedback": "No grammar data available"},
                 "errors": [],
                 "overall_grammar_score": 0,
-                "local_metrics": {}
+                "deterministic_confidence": 0.0,
+                "local_metrics": {"engine": "heuristic_only"}
             }
 
         sentences = [part.strip() for part in re.split(r"[.!?]+", transcript) if part.strip()]
@@ -679,63 +804,123 @@ class WhisperService:
         )
 
         errors = []
+        seen_errors = set()
         lower_text = transcript.lower()
 
         for match in re.finditer(r"\b(i)\s+is\b", lower_text):
-            errors.append({
+            item = {
                 "original": match.group(0),
                 "correction": "I am",
                 "type": "grammar",
                 "explanation": "Subject-verb agreement mismatch."
-            })
+            }
+            key = (item["original"], item["correction"], item["type"])
+            if key not in seen_errors:
+                seen_errors.add(key)
+                errors.append(item)
         for match in re.finditer(r"\b(he|she|it)\s+(are|have)\b", lower_text):
             subject = match.group(1)
             verb = match.group(2)
             replacement = "has" if verb == "have" else "is"
-            errors.append({
+            item = {
                 "original": match.group(0),
                 "correction": f"{subject} {replacement}",
                 "type": "grammar",
                 "explanation": "Third-person singular agreement issue."
-            })
+            }
+            key = (item["original"], item["correction"], item["type"])
+            if key not in seen_errors:
+                seen_errors.add(key)
+                errors.append(item)
         for match in re.finditer(r"\ba\s+[aeiou]\w*\b", lower_text):
-            errors.append({
+            item = {
                 "original": match.group(0),
                 "correction": match.group(0).replace("a ", "an ", 1),
                 "type": "grammar",
                 "explanation": "Article usage before a vowel sound may be incorrect."
-            })
+            }
+            key = (item["original"], item["correction"], item["type"])
+            if key not in seen_errors:
+                seen_errors.add(key)
+                errors.append(item)
         for match in re.finditer(r"\ban\s+[b-df-hj-np-tv-z]\w*\b", lower_text):
-            errors.append({
+            item = {
                 "original": match.group(0),
                 "correction": match.group(0).replace("an ", "a ", 1),
                 "type": "grammar",
                 "explanation": "Article usage before a consonant sound may be incorrect."
-            })
+            }
+            key = (item["original"], item["correction"], item["type"])
+            if key not in seen_errors:
+                seen_errors.add(key)
+                errors.append(item)
         for match in re.finditer(r"\bdid\s+\w+ed\b", lower_text):
-            errors.append({
+            item = {
                 "original": match.group(0),
                 "correction": "did + base verb",
                 "type": "tense",
                 "explanation": "After 'did', the base form is typically expected."
-            })
+            }
+            key = (item["original"], item["correction"], item["type"])
+            if key not in seen_errors:
+                seen_errors.add(key)
+                errors.append(item)
         for match in re.finditer(r"\b(\w+)\s+\1\b", lower_text):
             if len(match.group(1)) > 2:
-                errors.append({
+                item = {
                     "original": match.group(0),
                     "correction": match.group(1),
                     "type": "syntax",
                     "explanation": "Word repetition can indicate a false start or grammatical disfluency."
-                })
+                }
+                key = (item["original"], item["correction"], item["type"])
+                if key not in seen_errors:
+                    seen_errors.add(key)
+                    errors.append(item)
 
-        errors = errors[:12]
+        language_tool_match_count = 0
+        tool = self._get_language_tool()
+        if tool is not None:
+            try:
+                matches = tool.check(transcript)
+                language_tool_match_count = len(matches)
+                for match in matches[:12]:
+                    category = str(getattr(getattr(match, "category", None), "id", "") or "").lower()
+                    rule_id = str(getattr(match, "ruleId", "") or "").lower()
+                    message = str(getattr(match, "message", "") or "")
+                    issue_type = "grammar"
+                    if "tense" in rule_id or "tense" in message.lower():
+                        issue_type = "tense"
+                    elif "punct" in category or "style" in category:
+                        issue_type = "syntax"
+                    replacement = ""
+                    replacements = getattr(match, "replacements", None)
+                    if replacements:
+                        replacement = replacements[0]
+                    context = str(getattr(match, "context", "") or "")
+                    item = {
+                        "original": context.strip() or "text_span",
+                        "correction": replacement or "See suggestion",
+                        "type": issue_type,
+                        "explanation": message
+                    }
+                    key = (item["original"], item["correction"], item["type"])
+                    if key not in seen_errors:
+                        seen_errors.add(key)
+                        errors.append(item)
+            except Exception:
+                pass
+
+        errors = errors[:16]
 
         range_score = self._clamp_band_score(
             4.5 + (complex_sentence_ratio * 4.0) + min(1.5, clause_marker_count * 0.25)
         )
 
         error_density = (len(errors) / len(tokens)) * 100 if tokens else 0.0
-        accuracy_penalty = min(4.0, error_density / 6.0)
+        accuracy_penalty = min(4.2, error_density / 5.8)
+        if language_tool_match_count > 0:
+            accuracy_penalty += min(1.2, language_tool_match_count / 10)
         accuracy_score = self._clamp_band_score(8.5 - accuracy_penalty)
 
         past_markers = {"was", "were", "had", "did", "went", "made", "saw"}
@@ -747,6 +932,11 @@ class WhisperService:
         tense_score = self._clamp_band_score(4.0 + (tense_consistency * 5.0))
 
         overall_grammar = self._clamp_band_score((range_score + accuracy_score + tense_score) / 3)
+        deterministic_confidence = 0.55
+        engine = "heuristic_only"
+        if tool is not None:
+            deterministic_confidence = min(1.0, 0.75 + min(0.2, language_tool_match_count / 80))
+            engine = "language_tool_plus_heuristics"
 
         return {
             "range_of_structures": {
@@ -755,7 +945,7 @@ class WhisperService:
             },
             "grammar_accuracy": {
                 "score": accuracy_score,
-                "feedback": "Accuracy estimated from heuristic agreement/article/tense pattern checks."
+                "feedback": "Deterministic score from LanguageTool findings (if available) and heuristic checks."
             },
             "tense_accuracy": {
                 "score": tense_score,
@@ -763,13 +953,16 @@ class WhisperService:
             },
             "errors": errors,
             "overall_grammar_score": overall_grammar,
+            "deterministic_confidence": round(deterministic_confidence, 3),
             "local_metrics": {
                 "sentence_count": len(sentences),
                 "average_sentence_length": round(avg_sentence_length, 2),
                 "complex_sentence_ratio": round(complex_sentence_ratio, 3),
                 "clause_marker_count": clause_marker_count,
                 "error_density_per_100_words": round(error_density, 2),
-                "tense_consistency": round(tense_consistency, 3)
+                "tense_consistency": round(tense_consistency, 3),
+                "language_tool_match_count": language_tool_match_count,
+                "engine": engine
             }
         }
 

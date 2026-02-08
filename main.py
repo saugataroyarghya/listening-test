@@ -65,11 +65,15 @@ def build_analysis_response(result: dict) -> dict:
 
     llm_lexical_score = llm_analysis.get("overall_lexical_score", 0)
     local_lexical_score = local_lexical.get("overall_lexical_score", 0)
-    lexical_score = combine_scores(llm_lexical_score, local_lexical_score)
+    lexical_confidence = local_lexical.get("deterministic_confidence", 0.0)
+    lexical_llm_weight = 0.7 if lexical_confidence < 0.5 else 0.5
+    lexical_score = combine_scores(llm_lexical_score, local_lexical_score, llm_weight=lexical_llm_weight)
 
     llm_grammar_score = llm_analysis.get("overall_grammar_score", 0)
     local_grammar_score = local_grammar.get("overall_grammar_score", 0)
-    grammar_score = combine_scores(llm_grammar_score, local_grammar_score)
+    grammar_confidence = local_grammar.get("deterministic_confidence", 0.0)
+    grammar_llm_weight = 0.65 if grammar_confidence < 0.7 else 0.45
+    grammar_score = combine_scores(llm_grammar_score, local_grammar_score, llm_weight=grammar_llm_weight)
 
     pronunciation_score = round(
         (

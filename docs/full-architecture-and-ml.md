@@ -18,12 +18,14 @@ This document describes the current production behavior of the codebase in detai
 - `GET /`: basic API metadata.
 - `GET /health`: readiness (`whisper_loaded`, `groq_configured`).
 - `GET /analyzeSpeech?url=...`: full transcription + analysis pipeline.
+- `POST /analyzeSpeechFile`: multipart file-upload analysis pipeline (`file` field, mp3/audio).
 
 ### 1.3 External dependencies
 
 - Audio source: arbitrary URL passed to `/analyzeSpeech`.
 - STT model: `faster-whisper` (`small.en`, CPU, `int8`).
 - LLM scorer: Groq chat completions (`llama-3.3-70b-versatile`).
+- Optional deterministic grammar engine: `language_tool_python` (if installed/available).
 
 ### 1.4 End-to-end flow (`/analyzeSpeech`)
 
@@ -258,6 +260,12 @@ Features:
   - `moving_ttr = mean(TTR(window_i))`
 - sophisticated ratio:
   - content words with `len(word) >= 7` over content words
+- CEFR lexicon matching:
+  - deterministic lexicon tiers: `A1, A2, B1, B2, C1`
+  - token mapped to the highest tier where present
+  - `coverage = matched_content_tokens / total_content_tokens`
+  - `difficulty_score = mean(CEFR_WEIGHT(token_level))`, with `A1=1 ... C1=5`
+  - `unknown_ratio = unmatched_content_tokens / total_content_tokens`
 - idiom hits from phrase list:
   - `"on the other hand"`, `"as far as i know"`, `"at the end of the day"`, `"in my opinion"`, `"for instance"`, `"to be honest"`, `"as a result"`
 - repetition ratio:
@@ -267,24 +275,34 @@ Features:
 Scores (all clamped to 1-9):
 
 - Vocabulary range:
-  - `range_score = 4.5 + (moving_ttr * 5.0) + (sophisticated_ratio * 7.0)`
+  - `cefr_weighted_range = 4.2 + (difficulty_score * 0.95)`
+  - `diversity_range = 2.4 + (moving_ttr * 5.1) + (sophisticated_ratio * 3.1)`
+  - `range_score = 0.65*cefr_weighted_range + 0.35*diversity_range`
 - Accuracy:
   - start `8.0`
   - penalty `+1.2` if `repetition_ratio > 0.14`
   - else penalty `+0.6` if `repetition_ratio > 0.1`
   - additional `+0.7` if `avg_confidence < 0.72`
+  - additional `+0.5` if `unknown_ratio > 0.75`
   - `accuracy_score = clamp_1_to_9(8.0 - penalty)`
 - Idiomatic:
   - `idiomatic_score = clamp_1_to_9(5.5 + min(2.8, idiom_count * 0.8))`
 - Overall lexical:
   - `overall_lexical_score = mean(range_score, accuracy_score, idiomatic_score)`
+- Deterministic confidence:
+  - `deterministic_confidence = clamp_0_to_1(0.7*coverage + 0.3*(1-repetition_ratio))`
+- CEFR mapping:
+  - `C1` if `difficulty_score >= 4.6` and `coverage >= 0.18`
+  - `B2` if `difficulty_score >= 3.6` and `coverage >= 0.22`
+  - `B1` if `difficulty_score >= 2.6` and `coverage >= 0.28`
+  - `A2` if `difficulty_score >= 1.8` and `coverage >= 0.32`
+  - else `A1`
 
-CEFR mapping:
-- `C1` if `moving_ttr >= 0.72` and `sophisticated_ratio >= 0.24`
-- `B2` if `moving_ttr >= 0.65` and `sophisticated_ratio >= 0.18`
-- `B1` if `moving_ttr >= 0.56`
-- `A2` if `moving_ttr >= 0.48`
-- else `A1`
+Returned local lexical metadata includes:
+- `deterministic_confidence`
+- `cefr_coverage`, `cefr_difficulty_score`, `cefr_unknown_ratio`
+- `cefr_level_counts`
+- `engine = "cefr_lexicon"`
 
 ## 2.6 Grammar model (local deterministic)
 
@@ -296,14 +314,17 @@ Features:
   - proportion of sentences containing subordinators:
     - `because, although, while, whereas, unless, since, if, when, after, before`
 - clause marker count
-- heuristic error detectors:
+- heuristic error detectors (always-on):
   - `i is`
   - `(he|she|it) are|have`
   - `a + vowel-start word`
   - `an + consonant-start word`
   - `did + past-tense (-ed) form`
   - adjacent repeated words (`word word`)
-- max returned errors: 12
+- optional `LanguageTool` pass:
+  - if `language_tool_python` is available and initializes successfully, additional deterministic grammar matches are merged
+  - if unavailable/fails, fallback remains heuristic-only
+- max returned errors: 16
 
 Scores (clamped 1-9):
 
@@ -311,7 +332,8 @@ Scores (clamped 1-9):
   - `range_score = 4.5 + (complex_sentence_ratio * 4.0) + min(1.5, clause_marker_count * 0.25)`
 - Grammar accuracy:
   - `error_density = (error_count / token_count) * 100`
-  - `accuracy_penalty = min(4.0, error_density / 6.0)`
+  - `accuracy_penalty = min(4.2, error_density / 5.8)`
+  - if LanguageTool active: `accuracy_penalty += min(1.2, language_tool_match_count / 10)`
   - `accuracy_score = 8.5 - accuracy_penalty`
 - Tense accuracy:
   - past markers:
@@ -322,6 +344,14 @@ Scores (clamped 1-9):
   - `tense_score = 4.0 + (tense_consistency * 5.0)`
 - Overall grammar:
   - `overall_grammar_score = mean(range_score, accuracy_score, tense_score)`
+- Deterministic confidence:
+  - default heuristic-only baseline: `0.55`
+  - if LanguageTool active: `min(1.0, 0.75 + min(0.2, language_tool_match_count / 80))`
+
+Returned local grammar metadata includes:
+- `deterministic_confidence`
+- `language_tool_match_count`
+- `engine = "language_tool_plus_heuristics"` or `"heuristic_only"`
 
 ## 3. LLM Prompting and Hybrid Scoring
 
@@ -355,8 +385,16 @@ Prompt layers:
 For fluency, lexical, grammar:
 
 - `combine_scores(llm_score, local_score, llm_weight=0.6)`
+- fluency uses fixed blend:
+  - `llm_weight = 0.6`
+- lexical uses adaptive blend:
+  - if `lexical_deterministic_confidence < 0.5`, `llm_weight = 0.7`
+  - else `llm_weight = 0.5`
+- grammar uses adaptive blend:
+  - if `grammar_deterministic_confidence < 0.7`, `llm_weight = 0.65`
+  - else `llm_weight = 0.45`
 - if both available:
-  - `hybrid = llm_score*0.6 + local_score*0.4`
+  - `hybrid = llm_score*llm_weight + local_score*(1-llm_weight)`
 - if one is missing/zero:
   - fallback to available score
 
@@ -389,7 +427,7 @@ Top-level:
 ## 5. Notes and limitations
 
 - Prosody currently uses timing/confidence proxies, not direct F0 extraction.
-- Grammar/lexical local analyzers are heuristic and rule-based, not trained supervised models.
+- Lexical scoring is now deterministic CEFR-lexicon based, but lexicon breadth still limits coverage and domain vocabulary handling.
+- Grammar scoring is deterministic with optional LanguageTool; behavior degrades gracefully to heuristics when the tool is unavailable.
 - LLM output stability still depends on prompt/model behavior.
 - Overall band is an internal composite score and is not externally calibrated to official IELTS examiner labels.
-
