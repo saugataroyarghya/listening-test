@@ -38,7 +38,7 @@ def test_analyze_speech_file_requires_file():
 
 
 def test_analyze_speech_file_endpoint_structure(monkeypatch):
-    async def mock_transcribe_from_file_bytes(file_bytes, suffix=".mp3"):
+    async def mock_transcribe_from_upload_file(file, suffix=".mp3"):
         return {
             "text": "I think this is a good example for testing.",
             "annotated": "I(0.99) think(0.98) this(0.97) is(0.97) a(0.96) good(0.96) example(0.95) for(0.95) testing(0.94)",
@@ -82,7 +82,7 @@ def test_analyze_speech_file_endpoint_structure(monkeypatch):
             "overall_grammar_score": 7
         }
 
-    monkeypatch.setattr("main.transcription_service.transcribe_from_file_bytes", mock_transcribe_from_file_bytes)
+    monkeypatch.setattr("main.transcription_service.transcribe_from_upload_file", mock_transcribe_from_upload_file)
     monkeypatch.setattr("main.groq_service.get_ielts_analysis", mock_get_ielts_analysis)
 
     response = client.post(

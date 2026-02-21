@@ -1,10 +1,13 @@
 import os
 import json
+import asyncio
+import threading
 import httpx
 import tempfile
 import math
 import re
 import statistics
+from urllib.parse import urlsplit
 from groq import Groq
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
@@ -61,19 +64,78 @@ CEFR_LEXICON = {
 CEFR_ORDER = ["A1", "A2", "B1", "B2", "C1"]
 CEFR_WEIGHT = {"A1": 1.0, "A2": 2.0, "B1": 3.0, "B2": 4.0, "C1": 5.0}
 
+
+def _env_int(name: str, default: int | None = None, minimum: int | None = None) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return minimum
+    return parsed
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 class WhisperService:
     def __init__(self, load_model: bool = True):
         self.model = None
         self._language_tool = None
         self._language_tool_failed = False
+        default_transcription_concurrency = max(1, min(2, os.cpu_count() or 1))
+        self.transcription_concurrency = (
+            _env_int(
+                "TRANSCRIPTION_CONCURRENCY_LIMIT",
+                default_transcription_concurrency,
+                minimum=1
+            ) or default_transcription_concurrency
+        )
+        self._transcribe_semaphore = threading.BoundedSemaphore(self.transcription_concurrency)
+        self.download_chunk_size = _env_int("AUDIO_DOWNLOAD_CHUNK_SIZE", 64 * 1024, minimum=1024) or 64 * 1024
+        self.upload_chunk_size = _env_int("AUDIO_UPLOAD_CHUNK_SIZE", 64 * 1024, minimum=1024) or 64 * 1024
+        self.download_timeout_seconds = _env_float("AUDIO_DOWNLOAD_TIMEOUT_SECONDS", 30.0)
+        max_audio_mb = _env_float("MAX_AUDIO_SIZE_MB", 0.0)
+        self.max_audio_bytes = int(max_audio_mb * 1024 * 1024) if max_audio_mb > 0 else 0
+
+        self._transcribe_kwargs = {
+            "language": "en",
+            "word_timestamps": True,
+            "vad_filter": False,
+            "initial_prompt": "Um, uh, like, you know, hmm, ah",
+        }
+        beam_size = _env_int("WHISPER_BEAM_SIZE", None, minimum=1)
+        best_of = _env_int("WHISPER_BEST_OF", None, minimum=1)
+        if beam_size:
+            self._transcribe_kwargs["beam_size"] = beam_size
+        if best_of:
+            self._transcribe_kwargs["best_of"] = best_of
+
         if load_model:
-            # M4 Mac Optimization - uses CoreML automatically
+            model_name = os.getenv("WHISPER_MODEL_NAME", "small.en")
+            model_kwargs = {
+                "device": os.getenv("WHISPER_DEVICE", "cpu"),
+                "compute_type": os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
+            }
+            cpu_threads = _env_int("WHISPER_CPU_THREADS", None, minimum=1)
+            num_workers = _env_int("WHISPER_NUM_WORKERS", None, minimum=1)
+            if cpu_threads:
+                model_kwargs["cpu_threads"] = cpu_threads
+            if num_workers:
+                model_kwargs["num_workers"] = num_workers
+
             print("Loading Whisper model...")
-            self.model = WhisperModel(
-                "small.en",
-                device="cpu",
-                compute_type="int8",  # Optimized for M4
-            )
+            self.model = WhisperModel(model_name, **model_kwargs)
             print("✓ Whisper model loaded")
 
     def _safe_percentile(self, values: list[float], percentile: float) -> float:
@@ -106,6 +168,36 @@ class WhisperService:
         except Exception:
             self._language_tool_failed = True
             return None
+
+    def _validate_audio_size(self, total_bytes: int):
+        if self.max_audio_bytes and total_bytes > self.max_audio_bytes:
+            raise ValueError(
+                f"Audio too large ({total_bytes} bytes). "
+                f"Configured limit is {self.max_audio_bytes} bytes."
+            )
+
+    def _guess_suffix(self, url: str, fallback: str = ".mp3") -> str:
+        path = urlsplit(url).path
+        suffix = os.path.splitext(path)[1].lower()
+        if len(suffix) > 10:
+            return fallback
+        return suffix or fallback
+
+    async def _transcribe_temp_audio(self, temp_path: str) -> dict:
+        full_text, annotated, words_data, alignment_meta = await asyncio.to_thread(
+            self._transcribe_with_limit,
+            temp_path
+        )
+        return {
+            "text": full_text,
+            "annotated": annotated,
+            "words": words_data,
+            "alignment": alignment_meta
+        }
+
+    def _transcribe_with_limit(self, temp_path: str):
+        with self._transcribe_semaphore:
+            return self.transcribe_with_confidence(temp_path)
 
     def _score_cefr_from_lexicon(self, tokens: list[str]) -> dict:
         content_tokens = [token for token in tokens if len(token) > 2]
@@ -967,26 +1059,63 @@ class WhisperService:
         }
 
     async def transcribe_from_url(self, url: str):
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-        return await self.transcribe_from_file_bytes(response.content, suffix=".mp3")
+        temp_path = None
+        total_bytes = 0
+        timeout = httpx.Timeout(
+            connect=min(10.0, self.download_timeout_seconds),
+            read=self.download_timeout_seconds,
+            write=self.download_timeout_seconds,
+            pool=self.download_timeout_seconds
+        )
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    suffix = self._guess_suffix(str(response.url))
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+                        temp_path = temp_audio.name
+                        async for chunk in response.aiter_bytes(chunk_size=self.download_chunk_size):
+                            if not chunk:
+                                continue
+                            total_bytes += len(chunk)
+                            self._validate_audio_size(total_bytes)
+                            temp_audio.write(chunk)
+
+            if not temp_path:
+                raise RuntimeError("Failed to create temporary audio file")
+            return await self._transcribe_temp_audio(temp_path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     async def transcribe_from_file_bytes(self, file_bytes: bytes, suffix: str = ".mp3"):
         temp_path = None
         try:
+            self._validate_audio_size(len(file_bytes))
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
                 temp_audio.write(file_bytes)
                 temp_path = temp_audio.name
 
-            full_text, annotated, words_data, alignment_meta = self.transcribe_with_confidence(temp_path)
+            return await self._transcribe_temp_audio(temp_path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
-            return {
-                "text": full_text,
-                "annotated": annotated,
-                "words": words_data,
-                "alignment": alignment_meta
-            }
+    async def transcribe_from_upload_file(self, upload_file, suffix: str = ".mp3"):
+        temp_path = None
+        total_bytes = 0
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+                temp_path = temp_audio.name
+                while True:
+                    chunk = await upload_file.read(self.upload_chunk_size)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    self._validate_audio_size(total_bytes)
+                    temp_audio.write(chunk)
+
+            return await self._transcribe_temp_audio(temp_path)
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -996,16 +1125,7 @@ class WhisperService:
             raise RuntimeError("Whisper model is not loaded")
 
         # Transcribe with word-level timestamps
-        segments, info = self.model.transcribe(
-            audio_path,
-            language="en",
-            word_timestamps=True,  # Enable word-level data
-            vad_filter=False,  # Don't filter filler words
-            initial_prompt="Um, uh, like, you know, hmm, ah",  # Preserve fillers
-        )
-
-        full_text = []
-        annotated_transcript = []
+        segments, _ = self.model.transcribe(audio_path, **self._transcribe_kwargs)
         words_data = []
 
         # Extract words with confidence
@@ -1022,9 +1142,6 @@ class WhisperService:
                     confidence = 0.5
 
                 confidence = round(confidence, 2)
-
-                full_text.append(word_text)
-                annotated_transcript.append(f"{word_text}({confidence})")
                 words_data.append({
                     "word": word_text,
                     "confidence": confidence,
@@ -1048,7 +1165,10 @@ class GroqService:
         if not api_key:
             print("⚠️  Warning: GROQ_API_KEY not set")
         self.client = Groq(api_key=api_key) if api_key else None
-        self.model_id = "llama-3.3-70b-versatile"
+        self.model_id = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
+        self.max_tokens = _env_int("GROQ_MAX_TOKENS", 2000, minimum=256) or 2000
+        self.legacy_max_tokens = _env_int("GROQ_LEGACY_MAX_TOKENS", 1000, minimum=256) or 1000
+        self.temperature = _env_float("GROQ_TEMPERATURE", 0.5)
 
     def get_ielts_analysis(
         self,
@@ -1219,8 +1339,8 @@ Provide detailed, constructive feedback with specific examples from the transcri
                 {"role": "user", "content": f"{prompt}\n{feature_context_text}"}
             ],
             response_format={"type": "json_object"},
-            temperature=0.5,
-            max_tokens=2000
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
         )
 
         return json.loads(response.choices[0].message.content)
@@ -1250,7 +1370,7 @@ Please analyze the speech quality and provide insights.
             ],
             response_format={"type": "json_object"},
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=self.legacy_max_tokens
         )
 
         return json.loads(response.choices[0].message.content)

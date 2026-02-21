@@ -136,6 +136,9 @@ Thumbs.db
 # FastAPI specific
 *.db
 *.sqlite
+# Documentation
+/docs/
 
-# Claude Code
+# Agent Code
 CLAUDE.md
+AGENTS.md

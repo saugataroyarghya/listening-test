@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from starlette.concurrency import run_in_threadpool
 from services import transcription_service, groq_service
 from dotenv import load_dotenv
 import uvicorn
@@ -189,7 +190,7 @@ async def analyze_speech(
     """
     try:
         result = await transcription_service.transcribe_from_url(url)
-        return build_analysis_response(result)
+        return await run_in_threadpool(build_analysis_response, result)
 
     except Exception as e:
         import traceback
@@ -211,9 +212,8 @@ async def analyze_speech_file(file: UploadFile = File(...)):
         if file.filename and "." in file.filename:
             suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
 
-        file_bytes = await file.read()
-        result = await transcription_service.transcribe_from_file_bytes(file_bytes, suffix=suffix)
-        return build_analysis_response(result)
+        result = await transcription_service.transcribe_from_upload_file(file, suffix=suffix)
+        return await run_in_threadpool(build_analysis_response, result)
 
     except Exception as e:
         import traceback
