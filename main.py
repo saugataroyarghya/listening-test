@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from starlette.concurrency import run_in_threadpool
 from services import transcription_service, groq_service
 from dotenv import load_dotenv
@@ -25,7 +27,7 @@ def combine_scores(llm_score: float, local_score: float, llm_weight: float = 0.6
     return 0.0
 
 
-def build_analysis_response(result: dict) -> dict:
+def build_analysis_response(result: dict, question: Optional[str] = None) -> dict:
     words_data = result["words"]
 
     speaking_metrics = transcription_service.calculate_speaking_metrics(words_data)
@@ -37,6 +39,7 @@ def build_analysis_response(result: dict) -> dict:
     llm_analysis = groq_service.get_ielts_analysis(
         transcript=result["text"],
         annotated=result["annotated"],
+        question=question,
         speaking_metrics=speaking_metrics,
         feature_context={
             "fluency_features": speaking_metrics.get("fluency_features", {}),
@@ -173,6 +176,10 @@ async def analyze_speech(
     url: str = Query(
         default=DEFAULT_SPEECH_URL,
         description="URL of the audio file to transcribe and analyze"
+    ),
+    question: Optional[str] = Query(
+        default=None,
+        description="IELTS speaking prompt/question the speaker is responding to (optional)."
     )
 ):
     """
@@ -190,7 +197,7 @@ async def analyze_speech(
     """
     try:
         result = await transcription_service.transcribe_from_url(url)
-        return await run_in_threadpool(build_analysis_response, result)
+        return await run_in_threadpool(build_analysis_response, result, question)
 
     except Exception as e:
         import traceback
@@ -203,7 +210,13 @@ async def analyze_speech(
 
 
 @app.post("/analyzeSpeechFile")
-async def analyze_speech_file(file: UploadFile = File(...)):
+async def analyze_speech_file(
+    file: UploadFile = File(...),
+    question: Optional[str] = Form(
+        default=None,
+        description="IELTS speaking prompt/question the speaker is responding to (optional).",
+    ),
+):
     """
     Transcribe and analyze speech from an uploaded MP3/audio file.
     """
@@ -213,7 +226,7 @@ async def analyze_speech_file(file: UploadFile = File(...)):
             suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
 
         result = await transcription_service.transcribe_from_upload_file(file, suffix=suffix)
-        return await run_in_threadpool(build_analysis_response, result)
+        return await run_in_threadpool(build_analysis_response, result, question)
 
     except Exception as e:
         import traceback

@@ -56,7 +56,10 @@ def test_analyze_speech_file_endpoint_structure(monkeypatch):
             "alignment": {"adjusted_words": 0, "overlap_fixes": 0, "duration_fixes": 0, "micro_gap_fixes": 0}
         }
 
-    def mock_get_ielts_analysis(transcript, annotated, speaking_metrics=None, feature_context=None):
+    captured = {"question": None}
+
+    def mock_get_ielts_analysis(transcript, annotated, question=None, speaking_metrics=None, feature_context=None):
+        captured["question"] = question
         return {
             "fluency_and_coherence": {
                 "fluency": {"score": 7, "feedback": "Good flow."},
@@ -85,11 +88,14 @@ def test_analyze_speech_file_endpoint_structure(monkeypatch):
     monkeypatch.setattr("main.transcription_service.transcribe_from_upload_file", mock_transcribe_from_upload_file)
     monkeypatch.setattr("main.groq_service.get_ielts_analysis", mock_get_ielts_analysis)
 
+    question = "Describe a time you learned something important."
     response = client.post(
         "/analyzeSpeechFile",
-        files={"file": ("sample.mp3", b"fake-mp3-bytes", "audio/mpeg")}
+        files={"file": ("sample.mp3", b"fake-mp3-bytes", "audio/mpeg")},
+        data={"question": question},
     )
     assert response.status_code == 200
+    assert captured["question"] == question
     data = response.json()
     assert "transcript" in data
     assert "words" in data
