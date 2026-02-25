@@ -37,6 +37,11 @@ def test_analyze_speech_file_requires_file():
     assert response.status_code == 422
 
 
+def test_analyze_speech_file_simplified_requires_file():
+    response = client.post("/analyzeSpeechFileSimplified")
+    assert response.status_code == 422
+
+
 def test_analyze_speech_file_endpoint_structure(monkeypatch):
     async def mock_transcribe_from_upload_file(file, suffix=".mp3"):
         return {
@@ -101,6 +106,75 @@ def test_analyze_speech_file_endpoint_structure(monkeypatch):
     assert "words" in data
     assert "analysis" in data
     assert "overall" in data["analysis"]
+
+
+def test_analyze_speech_simplified_endpoint(monkeypatch):
+    async def mock_transcribe_from_url(url):
+        return {
+            "text": "Sample transcript from URL.",
+            "annotated": "Sample(0.99) transcript(0.98) from(0.97) URL(0.96)",
+            "words": [
+                {"word": "Sample", "confidence": 0.99, "start": 0.0, "end": 0.2},
+                {"word": "transcript", "confidence": 0.98, "start": 0.22, "end": 0.55},
+                {"word": "from", "confidence": 0.97, "start": 0.58, "end": 0.7},
+                {"word": "URL", "confidence": 0.96, "start": 0.72, "end": 0.9},
+            ],
+            "alignment": {"adjusted_words": 0, "overlap_fixes": 0, "duration_fixes": 0, "micro_gap_fixes": 0}
+        }
+
+    def mock_build_analysis_response(result, question=None):
+        return {
+            "transcript": result["text"],
+            "words": result["words"],
+            "alignment": result["alignment"],
+            "analysis": {"overall": {"band_score": 7.26}}
+        }
+
+    monkeypatch.setattr("main.transcription_service.transcribe_from_url", mock_transcribe_from_url)
+    monkeypatch.setattr("main.build_analysis_response", mock_build_analysis_response)
+
+    response = client.get("/analyzeSpeechSimpliied")
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"score", "answer_text"}
+    assert data["score"] == 7.5
+    assert data["answer_text"] == "Sample transcript from URL."
+
+
+def test_analyze_speech_file_simplified_endpoint(monkeypatch):
+    async def mock_transcribe_from_upload_file(file, suffix=".mp3"):
+        return {
+            "text": "Uploaded speech transcript.",
+            "annotated": "Uploaded(0.99) speech(0.98) transcript(0.97)",
+            "words": [
+                {"word": "Uploaded", "confidence": 0.99, "start": 0.0, "end": 0.28},
+                {"word": "speech", "confidence": 0.98, "start": 0.3, "end": 0.5},
+                {"word": "transcript", "confidence": 0.97, "start": 0.52, "end": 0.85},
+            ],
+            "alignment": {"adjusted_words": 0, "overlap_fixes": 0, "duration_fixes": 0, "micro_gap_fixes": 0}
+        }
+
+    def mock_build_analysis_response(result, question=None):
+        return {
+            "transcript": result["text"],
+            "words": result["words"],
+            "alignment": result["alignment"],
+            "analysis": {"overall": {"band_score": 6.0}}
+        }
+
+    monkeypatch.setattr("main.transcription_service.transcribe_from_upload_file", mock_transcribe_from_upload_file)
+    monkeypatch.setattr("main.build_analysis_response", mock_build_analysis_response)
+
+    response = client.post(
+        "/analyzeSpeechFileSimplified",
+        files={"file": ("sample.mp3", b"fake-mp3-bytes", "audio/mpeg")},
+        data={"question": "Any question"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"score", "answer_text"}
+    assert data["score"] == 6.0
+    assert data["answer_text"] == "Uploaded speech transcript."
 
 
 def test_speaking_metrics_calculation():

@@ -27,6 +27,20 @@ def combine_scores(llm_score: float, local_score: float, llm_weight: float = 0.6
     return 0.0
 
 
+def normalize_band_half_step(score: float) -> float:
+    rounded = round(score * 2) / 2
+    return float(max(1.0, min(9.0, rounded)))
+
+
+def build_simplified_response(full_response: dict) -> dict:
+    overall = full_response.get("analysis", {}).get("overall", {})
+    band_score = overall.get("band_score", 0.0)
+    return {
+        "score": normalize_band_half_step(band_score),
+        "answer_text": full_response.get("transcript", "")
+    }
+
+
 def build_analysis_response(result: dict, question: Optional[str] = None) -> dict:
     words_data = result["words"]
 
@@ -158,6 +172,8 @@ async def root():
         "endpoints": {
             "/analyzeSpeech": "Transcribe and analyze speech from audio URL",
             "/analyzeSpeechFile": "Transcribe and analyze speech from uploaded file",
+            "/analyzeSpeechSimpliied": "Transcribe/analyze from URL and return score + answer_text",
+            "/analyzeSpeechFileSimplified": "Transcribe/analyze upload and return score + answer_text",
             "/health": "Health check"
         }
     }
@@ -209,6 +225,32 @@ async def analyze_speech(
         raise HTTPException(status_code=500, detail=error_detail)
 
 
+@app.get("/analyzeSpeechSimpliied")
+async def analyze_speech_simplified(
+    url: str = Query(
+        default=DEFAULT_SPEECH_URL,
+        description="URL of the audio file to transcribe and analyze"
+    ),
+    question: Optional[str] = Query(
+        default=None,
+        description="IELTS speaking prompt/question the speaker is responding to (optional)."
+    )
+):
+    try:
+        result = await transcription_service.transcribe_from_url(url)
+        full_response = await run_in_threadpool(build_analysis_response, result, question)
+        return build_simplified_response(full_response)
+
+    except Exception as e:
+        import traceback
+        error_detail = {
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }
+        raise HTTPException(status_code=500, detail=error_detail)
+
+
 @app.post("/analyzeSpeechFile")
 async def analyze_speech_file(
     file: UploadFile = File(...),
@@ -227,6 +269,33 @@ async def analyze_speech_file(
 
         result = await transcription_service.transcribe_from_upload_file(file, suffix=suffix)
         return await run_in_threadpool(build_analysis_response, result, question)
+
+    except Exception as e:
+        import traceback
+        error_detail = {
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }
+        raise HTTPException(status_code=500, detail=error_detail)
+
+
+@app.post("/analyzeSpeechFileSimplified")
+async def analyze_speech_file_simplified(
+    file: UploadFile = File(...),
+    question: Optional[str] = Form(
+        default=None,
+        description="IELTS speaking prompt/question the speaker is responding to (optional).",
+    ),
+):
+    try:
+        suffix = ".mp3"
+        if file.filename and "." in file.filename:
+            suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
+
+        result = await transcription_service.transcribe_from_upload_file(file, suffix=suffix)
+        full_response = await run_in_threadpool(build_analysis_response, result, question)
+        return build_simplified_response(full_response)
 
     except Exception as e:
         import traceback
