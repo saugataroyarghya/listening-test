@@ -16,6 +16,26 @@ def test_health_endpoint():
     assert "groq_configured" in data
 
 
+def test_groq_api_key_uses_free_key_by_default(monkeypatch):
+    monkeypatch.delenv("GROQ_USE_PAID_KEY", raising=False)
+    monkeypatch.setenv("GROQ_FREE_KEY", "free-key")
+    monkeypatch.setenv("GROQ_PAID_KEY", "paid-key")
+
+    from services import resolve_groq_api_key
+
+    assert resolve_groq_api_key() == "free-key"
+
+
+def test_groq_api_key_uses_paid_key_when_enabled(monkeypatch):
+    monkeypatch.setenv("GROQ_USE_PAID_KEY", "true")
+    monkeypatch.setenv("GROQ_FREE_KEY", "free-key")
+    monkeypatch.setenv("GROQ_PAID_KEY", "paid-key")
+
+    from services import resolve_groq_api_key
+
+    assert resolve_groq_api_key() == "paid-key"
+
+
 def test_root_endpoint():
     """Test root endpoint returns API info"""
     response = client.get("/")

@@ -19,6 +19,23 @@ except ImportError:
 
 load_dotenv()
 
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in TRUE_ENV_VALUES
+
+
+def selected_groq_key_name() -> str:
+    return "GROQ_PAID_KEY" if _env_bool("GROQ_USE_PAID_KEY") else "GROQ_FREE_KEY"
+
+
+def resolve_groq_api_key() -> Optional[str]:
+    return os.getenv(selected_groq_key_name())
+
 CEFR_LEXICON = {
     "A1": {
         "i", "you", "he", "she", "we", "they", "my", "your", "our", "their", "name", "age", "family", "mother",
@@ -1162,9 +1179,9 @@ class WhisperService:
 
 class GroqService:
     def __init__(self):
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = resolve_groq_api_key()
         if not api_key:
-            print("⚠️  Warning: GROQ_API_KEY not set")
+            print(f"Warning: {selected_groq_key_name()} not set")
         self.client = Groq(api_key=api_key) if api_key else None
         self.model_id = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
         self.max_tokens = _env_int("GROQ_MAX_TOKENS", 2000, minimum=256) or 2000

@@ -5,7 +5,9 @@
 1. Set your API key in `.env`:
 
 ```bash
-GROQ_API_KEY=your_key_here
+GROQ_USE_PAID_KEY=false
+GROQ_FREE_KEY=your_free_key_here
+GROQ_PAID_KEY=your_paid_key_here
 ```
 
 2. Build and run:
